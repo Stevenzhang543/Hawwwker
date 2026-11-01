@@ -1,0 +1,156 @@
+/* Hawwwker v26.01 — design tokens（浅色 / 深色两套，跟随系统，可用 html[data-theme] 覆盖） */
+:root {
+  color-scheme: light;
+  --font: "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-num: "Segoe UI Variable Display", "SF Pro Display", "HarmonyOS Sans SC", "MiSans", system-ui, sans-serif;
+  --mono: "Cascadia Code", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+
+  /* 品牌 */
+  --brand-1: #3d7bff;
+  --brand-2: #8a5cff;
+  --brand: #3d6ef5;
+  --brand-ink: #2a58d6;
+  --brand-grad: linear-gradient(135deg, #3d7bff 0%, #6a66ff 52%, #8a5cff 100%);
+  --amber: #ffb020;
+  --amber-ink: #a35f00;
+  --ok: #138a4c;
+  --ok-bg: rgba(47, 210, 122, 0.14);
+  --warn: #b26a00;
+  --warn-bg: rgba(255, 159, 10, 0.16);
+  --err: #d6363c;
+  --err-bg: rgba(255, 77, 79, 0.13);
+  --info-bg: rgba(61, 123, 255, 0.12);
+  --purple: #7446e8;
+  --purple-bg: rgba(138, 92, 255, 0.13);
+
+  /* 表面 */
+  --bg-solid: #eef1f8;
+  --bg-tint: rgba(238, 241, 248, 0.58);
+  --text: #121624;
+  --text-2: #444c63;
+  --text-3: #636b82;
+  --line: rgba(18, 22, 36, 0.08);
+  --line-2: rgba(18, 22, 36, 0.14);
+  --hover: rgba(18, 22, 36, 0.05);
+  --press: rgba(18, 22, 36, 0.09);
+  --field: rgba(255, 255, 255, 0.72);
+  --field-border: rgba(18, 22, 36, 0.12);
+
+  --glass-1: rgba(255, 255, 255, 0.6);
+  --glass-2: rgba(255, 255, 255, 0.74);
+  --glass-3: rgba(250, 251, 255, 0.9);
+  --glass-edge: rgba(255, 255, 255, 0.85);
+  --glass-edge-2: rgba(18, 26, 60, 0.07);
+  --glass-blur: 22px;
+  --glass-sat: 170%;
+  --spec: rgba(255, 255, 255, 0.75);
+  --shadow-1: 0 1px 2px rgba(22, 30, 60, 0.05), 0 6px 20px rgba(22, 30, 60, 0.07);
+  --shadow-2: 0 2px 6px rgba(22, 30, 60, 0.07), 0 18px 48px rgba(22, 30, 60, 0.14);
+  --shadow-3: 0 10px 30px rgba(22, 30, 60, 0.16), 0 40px 90px rgba(22, 30, 60, 0.22);
+
+  --aurora-a: #6c9bff;
+  --aurora-b: #b292ff;
+  --aurora-c: #7fe0ff;
+  --aurora-d: #ffcf7a;
+  --aurora-opacity: 0.55;
+
+  /* 尺寸 */
+  --r-xs: 8px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 26px;
+  --titlebar-h: 38px;
+  --sidebar-w: 236px;
+  --rail-w: 68px;
+
+  /* 动效 */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --spring: cubic-bezier(0.34, 1.45, 0.64, 1);
+  --spring-soft: cubic-bezier(0.3, 1.2, 0.6, 1);
+  --t-fast: 160ms;
+  --t-mid: 280ms;
+  --t-slow: 460ms;
+}
+
+@supports (transition-timing-function: linear(0, 1)) {
+  :root {
+    --spring: linear(0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.281 6.7%, 0.723 12.9%, 0.938 16.7%, 1.017 18.6%, 1.077 20.6%, 1.121 22.6%, 1.149 24.3%, 1.163 26.6%, 1.154 29.9%, 1.129 32.8%, 1.051 39.6%, 1.017 43.1%, 0.991 46.9%, 0.977 51%, 0.975 57.1%, 0.997 69.8%, 1.003 76.9%, 1);
+    --spring-soft: linear(0, 0.012, 0.05 3.1%, 0.2 6.4%, 0.6 13.4%, 0.84 19%, 0.96 24.6%, 1.02 30.5%, 1.04 36%, 1.03 44%, 1.005 58%, 0.998 72%, 1);
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --brand: #6a95ff;
+    --brand-ink: #8fb0ff;
+    --amber-ink: #ffc24d;
+    --ok: #4be08f;
+    --warn: #ffb547;
+    --err: #ff7272;
+    --purple: #b597ff;
+    --bg-solid: #0b0e16;
+    --bg-tint: rgba(11, 14, 22, 0.62);
+    --text: #eef1f8;
+    --text-2: #b9c0d3;
+    --text-3: #8e97ae;
+    --line: rgba(255, 255, 255, 0.08);
+    --line-2: rgba(255, 255, 255, 0.14);
+    --hover: rgba(255, 255, 255, 0.06);
+    --press: rgba(255, 255, 255, 0.1);
+    --field: rgba(255, 255, 255, 0.05);
+    --field-border: rgba(255, 255, 255, 0.12);
+    --glass-1: rgba(26, 30, 44, 0.56);
+    --glass-2: rgba(30, 34, 50, 0.72);
+    --glass-3: rgba(24, 27, 40, 0.92);
+    --glass-edge: rgba(255, 255, 255, 0.1);
+    --glass-edge-2: rgba(0, 0, 0, 0.35);
+    --spec: rgba(255, 255, 255, 0.16);
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+    --shadow-2: 0 2px 8px rgba(0, 0, 0, 0.35), 0 22px 54px rgba(0, 0, 0, 0.45);
+    --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.45), 0 44px 100px rgba(0, 0, 0, 0.6);
+    --aurora-a: #2f5bff;
+    --aurora-b: #7a3dff;
+    --aurora-c: #00a6d6;
+    --aurora-d: #c27a00;
+    --aurora-opacity: 0.38;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --brand: #6a95ff;
+  --brand-ink: #8fb0ff;
+  --amber-ink: #ffc24d;
+  --ok: #4be08f;
+  --warn: #ffb547;
+  --err: #ff7272;
+  --purple: #b597ff;
+  --bg-solid: #0b0e16;
+  --bg-tint: rgba(11, 14, 22, 0.62);
+  --text: #eef1f8;
+  --text-2: #b9c0d3;
+  --text-3: #8e97ae;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-2: rgba(255, 255, 255, 0.14);
+  --hover: rgba(255, 255, 255, 0.06);
+  --press: rgba(255, 255, 255, 0.1);
+  --field: rgba(255, 255, 255, 0.05);
+  --field-border: rgba(255, 255, 255, 0.12);
+  --glass-1: rgba(26, 30, 44, 0.56);
+  --glass-2: rgba(30, 34, 50, 0.72);
+  --glass-3: rgba(24, 27, 40, 0.92);
+  --glass-edge: rgba(255, 255, 255, 0.1);
+  --glass-edge-2: rgba(0, 0, 0, 0.35);
+  --spec: rgba(255, 255, 255, 0.16);
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+  --shadow-2: 0 2px 8px rgba(0, 0, 0, 0.35), 0 22px 54px rgba(0, 0, 0, 0.45);
+  --shadow-3: 0 12px 34px rgba(0, 0, 0, 0.45), 0 44px 100px rgba(0, 0, 0, 0.6);
+  --aurora-a: #2f5bff;
+  --aurora-b: #7a3dff;
+  --aurora-c: #00a6d6;
+  --aurora-d: #c27a00;
+  --aurora-opacity: 0.38;
+}
