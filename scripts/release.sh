@@ -35,7 +35,9 @@ cd "$ROOT"
 
 echo "==> 1/7 Windows 安装包（$TARGET）"
 npx tauri build --target "$TARGET" --bundles nsis
-cp "$(ls "$REL"/bundle/nsis/${NAME}_*_x64-setup.exe | head -1)" "$OUT/$NAME-v$V-windows-x64-setup.exe"
+SETUP="$REL/bundle/nsis/${NAME}_$MAJOR.$((10#$MINOR)).0_x64-setup.exe"
+[ -f "$SETUP" ] || { echo "找不到本版本的安装包：$SETUP" >&2; exit 1; }
+cp "$SETUP" "$OUT/$NAME-v$V-windows-x64-setup.exe"
 
 echo "==> 2/7 便携版"
 makensis -V2 -DVERSION="$V" -DFILEVER="$FILEVER" -DSRCDIR="$REL" -DICON="$ROOT/src-tauri/icons/icon.ico" \

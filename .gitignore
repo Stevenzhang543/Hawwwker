@@ -5,3 +5,7 @@ src-tauri/gen
 *.log
 .DS_Store
 dist-web
+
+# 便携版数据（含登录会话与 API Key，切勿提交）
+Hawwwker-data/
+releases/*/Hawwwker-data/

@@ -1,7 +1,9 @@
 //! AI 客户端：OpenAI 兼容（DeepSeek / 通义 / Kimi / GLM / OpenAI / Gemini / Ollama）与 Anthropic 原生协议。
 //! 提供普通对话、JSON 输出（容错 + 一次纠错重试）、流式输出、用量统计与并发上限。
 
+pub mod analysis;
 pub mod copilot;
+pub mod copilot_prompts;
 pub mod planner;
 pub mod presets;
 pub mod prompts;
@@ -9,7 +11,7 @@ pub mod verify;
 
 use crate::db::{now_iso, Db};
 use crate::error::{AppError, AppResult};
-use crate::models::{AiConfig, AiConfigInput, AiStatus};
+use crate::models::{AiConfig, AiConfigInput, AiStatus, ModelList};
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -50,6 +52,7 @@ pub struct Opts {
 struct Resolved {
     protocol: String,
     url: String,
+    base: String,
     key: String,
     model: String,
     temperature: f64,
@@ -83,6 +86,98 @@ fn endpoint(protocol: &str, base: &str) -> String {
     } else {
         format!("{b}/chat/completions")
     }
+}
+
+/// 服务商特有的请求参数：结构化任务关闭"思考"模式（DeepSeek V4 / Qwen3 / GLM-5 默认开启，
+/// 会显著变慢，且部分服务在非流式调用时要求显式关闭）。
+fn provider_extras(protocol: &str, base: &str, model: &str, stream: bool) -> Vec<(&'static str, Value)> {
+    if protocol == "anthropic" {
+        return vec![];
+    }
+    let b = base.to_lowercase();
+    let m = model.to_lowercase();
+    let mut out = vec![];
+    if b.contains("deepseek.com") || m.starts_with("deepseek") {
+        out.push(("thinking", json!({"type": "disabled"})));
+    } else if b.contains("dashscope") || b.contains("aliyuncs.com") || (m.starts_with("qwen3") && !is_local(base)) {
+        // 百炼：非流式调用必须关闭思考；流式也关闭以保证 Copilot 响应速度
+        out.push(("enable_thinking", json!(false)));
+    } else if b.contains("bigmodel.cn") || m.starts_with("glm-5") || m.starts_with("glm-4.5") || m.starts_with("glm-4.6") || m.starts_with("glm-4.7") {
+        out.push(("thinking", json!({"type": "disabled"})));
+    }
+    let _ = stream;
+    out
+}
+
+/// 从非流式响应里取出正文与（可能存在的）推理内容。兼容 content 为字符串或分段数组、Anthropic 的 thinking 块。
+fn response_text(protocol: &str, v: &Value) -> (String, String) {
+    if protocol == "anthropic" {
+        let blocks = v["content"].as_array().cloned().unwrap_or_default();
+        let text = blocks.iter().filter(|b| b["type"].as_str().is_none_or(|t| t == "text")).filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("");
+        let thinking = blocks.iter().filter(|b| b["type"] == "thinking").filter_map(|b| b["thinking"].as_str()).collect::<Vec<_>>().join("");
+        return (text, thinking);
+    }
+    let msg = &v["choices"][0]["message"];
+    let text = match &msg["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str().or_else(|| p.as_str())).collect::<Vec<_>>().join(""),
+        _ => String::new(),
+    };
+    let reasoning = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str()).unwrap_or("").to_string();
+    (text, reasoning)
+}
+
+/// 流式增量里的正文（忽略 reasoning_content / thinking 增量）。
+fn delta_text(protocol: &str, v: &Value) -> String {
+    if protocol == "anthropic" {
+        if v["type"] == "content_block_delta" && v["delta"]["type"].as_str().is_none_or(|t| t == "text_delta") {
+            return v["delta"]["text"].as_str().unwrap_or("").to_string();
+        }
+        return String::new();
+    }
+    match &v["choices"][0]["delta"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""),
+        _ => String::new(),
+    }
+}
+
+/// 列模型接口：OpenAI 兼容为 {base}/models；Anthropic 为 {base}/v1/models。
+fn models_endpoint(protocol: &str, base: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    let b = b.strip_suffix("/chat/completions").or_else(|| b.strip_suffix("/messages")).unwrap_or(b);
+    if protocol == "anthropic" {
+        let b = if b.is_empty() { "https://api.anthropic.com" } else { b };
+        if b.ends_with("/v1") {
+            format!("{b}/models")
+        } else {
+            format!("{b}/v1/models")
+        }
+    } else {
+        format!("{b}/models")
+    }
+}
+
+/// 只保留可用于对话的模型：去掉向量、语音、图像、审核、重排等。
+pub fn chat_models(v: &Value) -> Vec<String> {
+    const SKIP: [&str; 16] = [
+        "embed", "embedding", "tts", "whisper", "dall-e", "image", "imagen", "moderation", "audio", "realtime", "transcribe", "rerank", "speech",
+        "vision-exp", "veo", "aqa",
+    ];
+    let arr = v["data"].as_array().or_else(|| v["models"].as_array()).cloned().unwrap_or_default();
+    let mut out: Vec<String> = arr
+        .iter()
+        .filter_map(|m| m["id"].as_str().or_else(|| m["name"].as_str()).or_else(|| m["model"].as_str()).or_else(|| m.as_str()))
+        .map(|id| id.trim_start_matches("models/").to_string())
+        .filter(|id| !id.is_empty())
+        .filter(|id| {
+            let l = id.to_lowercase();
+            !SKIP.iter().any(|k| l.contains(k))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn friendly_http(status: u16, body: &str) -> String {
@@ -146,8 +241,60 @@ pub fn extract_json(text: &str) -> Option<&str> {
 
 impl AiClient {
     pub fn new(db: Db, http: reqwest::Client) -> Self {
+        migrate_retired(&db);
         let max = db.setting::<AiConfig>("ai_config").map(|c| c.max_concurrency).unwrap_or(3).clamp(1, 8);
         AiClient { db, http, sem: RwLock::new(Arc::new(Semaphore::new(max as usize))) }
+    }
+
+    /// 列出服务商当前可用的模型。input 为空时用已保存的配置；input 没带 Key 时沿用已保存的 Key。
+    pub async fn list_models(&self, input: Option<AiConfigInput>) -> ModelList {
+        let saved = self.config();
+        let (protocol, base) = match &input {
+            Some(i) => (if i.protocol == "anthropic" { "anthropic".to_string() } else { "openai".to_string() }, i.base_url.trim().to_string()),
+            None => (saved.protocol.clone(), saved.base_url.clone()),
+        };
+        if base.is_empty() && protocol != "anthropic" {
+            return ModelList { models: vec![], message: Some("请先填写 Base URL".into()) };
+        }
+        let key = input
+            .as_ref()
+            .and_then(|i| i.api_key.clone())
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| self.db.secret(KEY_SECRET))
+            .unwrap_or_default();
+        if key.is_empty() && !is_local(&base) {
+            return ModelList { models: vec![], message: Some("请先填写 API Key".into()) };
+        }
+        let url = models_endpoint(&protocol, &base);
+        let mut req = self.http.get(&url).timeout(Duration::from_secs(15));
+        req = if protocol == "anthropic" {
+            req.header("x-api-key", key.trim()).header("anthropic-version", "2023-06-01")
+        } else if key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(key.trim())
+        };
+        match req.send().await {
+            Err(e) => ModelList {
+                models: vec![],
+                message: Some(if e.is_timeout() { "获取模型列表超时".into() } else { format!("无法连接模型服务：{}", e.without_url()) }),
+            },
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let text = resp.text().await.unwrap_or_default();
+                if status >= 400 {
+                    return ModelList { models: vec![], message: Some(friendly_http(status, &text)) };
+                }
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(v) => {
+                        let models = chat_models(&v);
+                        let message = if models.is_empty() { Some("服务商没有返回可用的对话模型，可手动填写模型名".into()) } else { None };
+                        ModelList { models, message }
+                    }
+                    Err(_) => ModelList { models: vec![], message: Some("该服务不支持列出模型，可手动填写模型名".into()) },
+                }
+            }
+        }
     }
 
     /* ------------------------------------------------------------ 配置 */
@@ -274,6 +421,7 @@ impl AiClient {
         Ok(Resolved {
             protocol: c.protocol.clone(),
             url: endpoint(&c.protocol, &c.base_url),
+            base: c.base_url.clone(),
             key: self.db.secret(KEY_SECRET).unwrap_or_else(|| "ollama".into()),
             model,
             temperature: c.temperature,
@@ -281,7 +429,7 @@ impl AiClient {
         })
     }
 
-    fn body(&self, r: &Resolved, msgs: &[Msg], o: &Opts, stream: bool, with_format: bool) -> Value {
+    fn body(&self, r: &Resolved, msgs: &[Msg], o: &Opts, stream: bool, with_format: bool, with_extras: bool) -> Value {
         let temperature = o.temperature.unwrap_or(r.temperature);
         if r.protocol == "anthropic" {
             let system: Vec<&str> = msgs.iter().filter(|m| m.role == "system").map(|m| m.content.as_str()).collect();
@@ -305,6 +453,11 @@ impl AiClient {
         } else {
             let list: Vec<Value> = msgs.iter().map(|m| json!({"role": m.role, "content": m.content})).collect();
             let mut b = json!({"model": r.model, "messages": list, "temperature": temperature});
+            if with_extras {
+                for (k, v) in provider_extras(&r.protocol, &r.base, &r.model, stream) {
+                    b[k] = v;
+                }
+            }
             if let Some(mt) = o.max_tokens {
                 b["max_tokens"] = json!(mt);
             }
@@ -338,8 +491,9 @@ impl AiClient {
         let sem = self.permit_source();
         let _permit = sem.acquire().await.map_err(|_| AppError::internal("AI 并发控制已关闭"))?;
         let mut with_format = true;
-        for attempt in 0..3 {
-            let body = self.body(&r, msgs, &o, false, with_format);
+        let mut with_extras = true;
+        for attempt in 0..4 {
+            let body = self.body(&r, msgs, &o, false, with_format, with_extras);
             let resp = match self.request(&r, &body).send().await {
                 Ok(x) => x,
                 Err(e) if attempt < 1 && (e.is_connect() || e.is_request()) => {
@@ -356,6 +510,10 @@ impl AiClient {
             };
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
+            if status == 400 && r.protocol == "openai" && with_extras && !provider_extras(&r.protocol, &r.base, &r.model, false).is_empty() {
+                with_extras = false; // 代理或旧版本不认识 thinking / enable_thinking 参数
+                continue;
+            }
             if status == 400 && o.json && with_format && r.protocol == "openai" {
                 with_format = false; // 部分兼容服务不支持 response_format
                 continue;
@@ -368,19 +526,21 @@ impl AiClient {
                 return Err(AppError::ai(friendly_http(status, &text)));
             }
             let v: Value = serde_json::from_str(&text).map_err(|_| AppError::ai("模型返回的内容无法解析"))?;
-            let (content, pt, ct) = if r.protocol == "anthropic" {
-                let content = v["content"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join(""))
-                    .unwrap_or_default();
-                (content, v["usage"]["input_tokens"].as_i64().unwrap_or(0), v["usage"]["output_tokens"].as_i64().unwrap_or(0))
+            let (content, reasoning) = response_text(&r.protocol, &v);
+            let (pt, ct) = if r.protocol == "anthropic" {
+                (v["usage"]["input_tokens"].as_i64().unwrap_or(0), v["usage"]["output_tokens"].as_i64().unwrap_or(0))
             } else {
-                let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
-                (content, v["usage"]["prompt_tokens"].as_i64().unwrap_or(0), v["usage"]["completion_tokens"].as_i64().unwrap_or(0))
+                (v["usage"]["prompt_tokens"].as_i64().unwrap_or(0), v["usage"]["completion_tokens"].as_i64().unwrap_or(0))
             };
             self.db.add_usage(pt, ct);
             // 推理模型可能把思考过程放在 <think> 中
             let cleaned = strip_think(&content);
+            // 少数推理模型把答案写进了推理字段、正文为空：结构化任务时退而取其中的 JSON
+            if cleaned.is_empty() && o.json {
+                if let Some(j) = extract_json(&reasoning) {
+                    return Ok(j.to_string());
+                }
+            }
             return Ok(cleaned);
         }
         Err(AppError::ai("模型服务多次重试仍失败"))
@@ -410,15 +570,23 @@ impl AiClient {
         let r = self.resolve(o.fast)?;
         let sem = self.permit_source();
         let _permit = sem.acquire().await.map_err(|_| AppError::internal("AI 并发控制已关闭"))?;
-        let body = self.body(&r, msgs, &o, true, false);
-        let resp = self.request(&r, &body).timeout(r.timeout * 3).send().await.map_err(|e| {
-            AppError::ai(if e.is_timeout() { "连接模型服务超时".into() } else { format!("无法连接模型服务：{e}") })
-        })?;
-        let status = resp.status().as_u16();
-        if status >= 400 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(AppError::ai(friendly_http(status, &text)));
-        }
+        let mut with_extras = true;
+        let resp = loop {
+            let body = self.body(&r, msgs, &o, true, false, with_extras);
+            let resp = self.request(&r, &body).timeout(r.timeout * 3).send().await.map_err(|e| {
+                AppError::ai(if e.is_timeout() { "连接模型服务超时".into() } else { format!("无法连接模型服务：{e}") })
+            })?;
+            let status = resp.status().as_u16();
+            if status == 400 && with_extras && r.protocol == "openai" && !provider_extras(&r.protocol, &r.base, &r.model, true).is_empty() {
+                with_extras = false;
+                continue;
+            }
+            if status >= 400 {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(AppError::ai(friendly_http(status, &text)));
+            }
+            break resp;
+        };
         let mut full = String::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
@@ -443,13 +611,13 @@ impl AiClient {
                     if v["type"] == "message_delta" {
                         ct = v["usage"]["output_tokens"].as_i64().unwrap_or(ct);
                     }
-                    if v["type"] == "content_block_delta" { v["delta"]["text"].as_str().unwrap_or("").to_string() } else { String::new() }
+                    delta_text(&r.protocol, &v)
                 } else {
                     if let Some(u) = v.get("usage").filter(|u| u.is_object()) {
                         pt = u["prompt_tokens"].as_i64().unwrap_or(pt);
                         ct = u["completion_tokens"].as_i64().unwrap_or(ct);
                     }
-                    v["choices"][0]["delta"]["content"].as_str().unwrap_or("").to_string()
+                    delta_text(&r.protocol, &v)
                 };
                 if piece.is_empty() {
                     continue;
@@ -485,6 +653,36 @@ impl AiClient {
         }
         self.db.add_usage(pt, ct);
         Ok(full)
+    }
+}
+
+/// 启动时把已停服的模型 ID 迁移到替代模型，并留下一条系统提醒。
+pub fn migrate_retired(db: &Db) {
+    let Some(mut c) = db.setting::<AiConfig>("ai_config") else { return };
+    let mut changes = vec![];
+    if let Some(r) = presets::replacement_for_base(&c.model, &c.base_url) {
+        changes.push(format!("{} → {r}", c.model));
+        c.model = r.to_string();
+    }
+    if let Some(r) = presets::replacement_for_base(&c.fast_model, &c.base_url) {
+        changes.push(format!("{} → {r}", c.fast_model));
+        c.fast_model = if r == c.model { String::new() } else { r.to_string() };
+    }
+    if changes.is_empty() {
+        return;
+    }
+    if db.put_setting("ai_config", &c).is_ok() {
+        log::info!("AI 模型已迁移：{}", changes.join("，"));
+        let _ = crate::notify::add(
+            db,
+            "system",
+            "warning",
+            "AI 模型已自动更新",
+            &format!("服务商已停用旧模型：{}。如果 AI 调用失败，请到「设置 · AI 模型」点「获取模型列表」重新选择并测试。", changes.join("，")),
+            "/settings/ai",
+            "",
+        )
+        .map_err(|e| log::warn!("migration notice failed: {}", e.message));
     }
 }
 
@@ -525,6 +723,118 @@ mod tests {
         assert_eq!(endpoint("anthropic", "https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
         assert_eq!(endpoint("anthropic", "https://x.y/v1"), "https://x.y/v1/messages");
         assert_eq!(endpoint("openai", "http://localhost:11434/v1"), "http://localhost:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn provider_specific_params() {
+        let ds = provider_extras("openai", "https://api.deepseek.com", "deepseek-flash", false);
+        assert_eq!(ds, vec![("thinking", serde_json::json!({"type": "disabled"}))]);
+        let qw = provider_extras("openai", "https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen3.8-max", false);
+        assert_eq!(qw, vec![("enable_thinking", serde_json::json!(false))]);
+        assert!(provider_extras("openai", "https://api.openai.com/v1", "gpt-6.1-sol", false).is_empty());
+        assert!(provider_extras("anthropic", "https://api.deepseek.com/anthropic", "deepseek-flash", false).is_empty());
+        assert!(provider_extras("openai", "http://localhost:11434/v1", "qwen3.5:9b", false).is_empty());
+    }
+
+    #[test]
+    fn robust_response_parsing() {
+        let v = serde_json::json!({"choices": [{"message": {"content": null, "reasoning_content": "想一想 {\"a\":1}"}}]});
+        assert_eq!(response_text("openai", &v), (String::new(), "想一想 {\"a\":1}".to_string()));
+        let v = serde_json::json!({"choices": [{"message": {"content": [{"type": "text", "text": "你"}, {"type": "text", "text": "好"}]}}]});
+        assert_eq!(response_text("openai", &v).0, "你好");
+        let v = serde_json::json!({"content": [{"type": "thinking", "thinking": "嗯"}, {"type": "text", "text": "答案"}]});
+        assert_eq!(response_text("anthropic", &v), ("答案".to_string(), "嗯".to_string()));
+        let d = serde_json::json!({"choices": [{"delta": {"reasoning_content": "思考中"}}]});
+        assert_eq!(delta_text("openai", &d), "");
+        let d = serde_json::json!({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "x"}});
+        assert_eq!(delta_text("anthropic", &d), "");
+    }
+
+    #[test]
+    fn model_listing_helpers() {
+        assert_eq!(models_endpoint("openai", "https://api.deepseek.com"), "https://api.deepseek.com/models");
+        assert_eq!(models_endpoint("openai", "https://api.openai.com/v1/chat/completions"), "https://api.openai.com/v1/models");
+        assert_eq!(models_endpoint("anthropic", "https://api.anthropic.com"), "https://api.anthropic.com/v1/models");
+        let v = serde_json::json!({"data": [{"id": "gpt-6.1-sol"}, {"id": "text-embedding-4"}, {"id": "models/gemini-3.8-flash"}, {"id": "gpt-6-tts"}, {"id": "deepseek-flash"}]});
+        assert_eq!(chat_models(&v), vec!["deepseek-flash", "gemini-3.8-flash", "gpt-6.1-sol"]);
+    }
+
+    #[test]
+    fn retired_models_migrate() {
+        let db = Db::memory().unwrap();
+        let cfg = AiConfig { protocol: "openai".into(), provider: "deepseek".into(), base_url: "https://api.deepseek.com/v1".into(), model: "deepseek-chat".into(), fast_model: "deepseek-reasoner".into(), ..Default::default() };
+        db.put_setting("ai_config", &cfg).unwrap();
+        migrate_retired(&db);
+        let c: AiConfig = db.setting("ai_config").unwrap();
+        assert_eq!(c.model, "deepseek-flash");
+        assert_eq!(c.fast_model, "", "fast model equal to main collapses to empty");
+        let n: i64 = db.conn().query_row("SELECT COUNT(*) FROM notices WHERE kind='system'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        migrate_retired(&db);
+        let n: i64 = db.conn().query_row("SELECT COUNT(*) FROM notices", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "idempotent");
+        // 中转服务上的旧 ID 不迁移
+        let db = Db::memory().unwrap();
+        let cfg = AiConfig { protocol: "openai".into(), provider: "custom".into(), base_url: "https://relay.example.com/v1".into(), model: "deepseek-chat".into(), ..Default::default() };
+        db.put_setting("ai_config", &cfg).unwrap();
+        migrate_retired(&db);
+        assert_eq!(db.setting::<AiConfig>("ai_config").unwrap().model, "deepseek-chat");
+    }
+
+    /// 模拟 DeepSeek：要求请求里带 thinking=disabled；不认识该参数的代理返回 400 时自动去掉重试；/models 列表。
+    #[tokio::test]
+    async fn mock_provider_roundtrip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                n += 1;
+                let mut buf = vec![0u8; 65536];
+                let mut len = 0;
+                loop {
+                    let k = sock.read(&mut buf[len..]).await.unwrap_or(0);
+                    if k == 0 { break; }
+                    len += k;
+                    let text = String::from_utf8_lossy(&buf[..len]).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let cl = text[..h].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                        if len >= h + 4 + cl { break; }
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf[..len]).to_string();
+                seen2.lock().unwrap().push(req.clone());
+                let (status, body) = if req.starts_with("GET /models") {
+                    ("200 OK", r#"{"object":"list","data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}"#.to_string())
+                } else if n == 1 && req.contains("\"thinking\"") {
+                    // 第一次：假装是不认识 thinking 参数的代理
+                    ("400 Bad Request", r#"{"error":{"message":"unknown field thinking"}}"#.to_string())
+                } else {
+                    ("200 OK", r#"{"choices":[{"message":{"content":"Hawwwker 已连接","reasoning_content":""}}],"usage":{"prompt_tokens":5,"completion_tokens":3}}"#.to_string())
+                };
+                let resp = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let db = Db::memory().unwrap();
+        let ai = AiClient::new(db.clone(), reqwest::Client::builder().no_proxy().build().unwrap());
+        ai.save_config(AiConfigInput {
+            protocol: "openai".into(), provider: "deepseek".into(), base_url: format!("http://127.0.0.1:{port}"),
+            model: "deepseek-flash".into(), fast_model: None, temperature: None, timeout_secs: None, max_concurrency: None, api_key: Some("sk-test".into()),
+        })
+        .unwrap();
+        let st = ai.test().await;
+        assert!(st.verified, "{:?}", st.last_error);
+        let reqs = seen.lock().unwrap().clone();
+        assert!(reqs[0].contains("\"thinking\":{\"type\":\"disabled\"}"), "first try sends thinking=disabled");
+        assert!(!reqs[1].contains("\"thinking\""), "retry without unknown param");
+        let list = ai.list_models(None).await;
+        assert_eq!(list.models, vec!["deepseek-flash", "deepseek-v4-pro"]);
+        assert!(seen.lock().unwrap().last().unwrap().to_lowercase().contains("authorization: bearer sk-test"));
     }
 
     #[test]

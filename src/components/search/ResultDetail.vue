@@ -11,6 +11,8 @@ import { useCopilotStore } from "@/stores/copilot";
 import { VERDICT, FLAG, CONDITION } from "@/utils/labels";
 import { copyText, dateTime, money } from "@/utils/format";
 import { hasLandedInfo } from "@/utils/landed";
+import { compactNum } from "@/utils/format";
+import { REVIEW_SOURCE, RISK_LEVEL, SHOP_KIND_LABEL, TONE_CHIP, itemTags, scoreParts, scoreTone, shopTone } from "./insight";
 import DealBadge from "@/components/ui/DealBadge.vue";
 import GSheet from "@/components/ui/GSheet.vue";
 import Icon from "@/components/ui/Icon.vue";
@@ -66,6 +68,17 @@ const it = computed(() => d.value?.item ?? null);
 const provisional = computed(() => !!it.value?.provisional);
 const deal = computed(() => d.value?.deal ?? it.value?.deal ?? null);
 const feedback = computed(() => props.fallback?.feedback ?? it.value?.feedback ?? null);
+
+/* v26.03 洞察：搜索进行中列表里的那条会随风险 / 店铺 / 评论阶段更新，优先用它 */
+const ins = computed<ResultItem | null>(() => (props.fallback && it.value && props.fallback.id === it.value.id ? props.fallback : it.value));
+const tags = computed(() => (ins.value ? itemTags(ins.value) : []));
+const parts = computed(() => (ins.value ? scoreParts(ins.value) : []));
+const shop = computed(() => ins.value?.shopInfo ?? null);
+const risk = computed(() => ins.value?.risk ?? null);
+const rev = computed(() => ins.value?.reviewInsight ?? null);
+const hasInsight = computed(() => !!(ins.value && (ins.value.finalScore != null || shop.value || risk.value || rev.value)));
+const shopScores = computed(() => Object.entries(shop.value?.scores ?? {}));
+const fmtScore = (k: string, v: number) => (v > 5 || /率|%/.test(k) ? `${Math.round(v)}%` : v.toFixed(1));
 
 const series = computed(() =>
   d.value && d.value.history.length
@@ -165,6 +178,113 @@ function ask() {
       </div>
 
       <div v-if="provisional" class="banner info"><Icon name="spark" />这是规则初判的结果，AI 正在逐条核对。核对完成后可看价格历史、同款比价并加入追踪。</div>
+
+      <div v-if="tags.length" class="chips">
+        <span v-for="t in tags" :key="t.kind + t.label" class="chip" :class="TONE_CHIP[t.tone] ?? ''">{{ t.label }}</span>
+      </div>
+
+      <!-- v26.03 综合评分构成 -->
+      <section v-if="hasInsight && ins" class="glass card">
+        <div class="card-head">
+          <h3>综合评分</h3>
+          <span v-if="ins.finalScore != null" class="big-score" :class="scoreTone(ins.finalScore)"><b class="num">{{ ins.finalScore }}</b><small>/ 100</small></span>
+          <span v-else class="chip outline">细筛进行中</span>
+          <span class="spacer"></span>
+          <span class="faint tiny">匹配、风险、店铺、评论、价格加权</span>
+        </div>
+        <div class="parts">
+          <div v-for="p in parts" :key="p.key" class="part" :title="p.hint">
+            <span class="pl">{{ p.label }}</span>
+            <span class="pbar"><i :class="scoreTone(p.value)" :style="{ width: (p.value ?? 0) + '%' }"></i></span>
+            <span class="pv num">{{ p.value ?? "—" }}</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 风险分析 -->
+      <section v-if="risk" class="glass card risk-box" :class="risk.level">
+        <div class="card-head">
+          <h3>风险分析</h3>
+          <span class="chip" :class="RISK_LEVEL[risk.level].tone"><Icon :name="RISK_LEVEL[risk.level].icon" :size="12" />{{ RISK_LEVEL[risk.level].label }} · {{ risk.score }}</span>
+          <span class="spacer"></span>
+          <span class="chip outline">{{ risk.aiChecked ? "AI 已复核" : "规则判断" }}</span>
+        </div>
+        <div class="rbar"><i :class="RISK_LEVEL[risk.level].tone" :style="{ width: Math.max(4, risk.score) + '%' }"></i></div>
+        <p v-if="risk.summary" class="small" style="margin-top: 8px">{{ risk.summary }}</p>
+        <ul v-if="risk.factors.length" class="factors">
+          <li v-for="f in risk.factors" :key="f.kind + f.label" :class="f.weight > 0 ? 'up' : 'down'">
+            <Icon :name="f.weight > 0 ? 'rise' : 'drop'" :size="13" />
+            <span>{{ f.label }}</span>
+            <span v-if="f.weight" class="num faint">{{ f.weight > 0 ? "+" : "" }}{{ f.weight }}</span>
+          </li>
+        </ul>
+        <p v-else class="faint small">没有发现明显的风险因素。</p>
+      </section>
+
+      <!-- 店铺 -->
+      <section v-if="shop" class="glass card">
+        <div class="card-head">
+          <h3>店铺</h3>
+          <span class="chip" :class="TONE_CHIP[shopTone(shop.kind)] ?? ''">{{ shop.label || SHOP_KIND_LABEL[shop.kind] }}</span>
+          <span class="spacer"></span>
+          <span class="cred" :class="scoreTone(shop.credibility)">可信度 <b class="num">{{ shop.credibility }}</b></span>
+        </div>
+        <div class="shop-grid">
+          <span v-if="shop.name"><small>店铺名</small><b class="ellipsis" :title="shop.name">{{ shop.name }}</b></span>
+          <span v-if="shop.rating != null"><small>店铺评分</small><b class="num">★ {{ shop.rating.toFixed(1) }}</b></span>
+          <span v-for="[k, v] in shopScores" :key="k"><small>{{ k }}</small><b class="num">{{ fmtScore(k, v) }}</b></span>
+          <span v-if="shop.years != null"><small>开店</small><b class="num">{{ shop.years >= 1 ? Math.round(shop.years) + " 年" : "不足 1 年" }}</b></span>
+          <span v-if="shop.followers != null"><small>粉丝</small><b class="num">{{ compactNum(shop.followers) }}</b></span>
+        </div>
+        <ul v-if="shop.notes.length" class="notes">
+          <li v-for="n in shop.notes" :key="n">{{ n }}</li>
+        </ul>
+      </section>
+
+      <!-- 评论分析 -->
+      <section v-if="rev" class="glass card">
+        <div class="card-head">
+          <h3>评论分析</h3>
+          <span class="chip outline">{{ REVIEW_SOURCE[rev.source] ?? rev.source }}</span>
+          <span v-if="rev.score != null" class="cred" :class="scoreTone(rev.score)">评论分 <b class="num">{{ rev.score }}</b></span>
+          <span class="spacer"></span>
+          <span class="faint tiny">读取 {{ rev.sampled }} 条{{ rev.aiChecked ? " · AI 已分析" : " · 等待 AI 分析" }}</span>
+        </div>
+        <div v-if="rev.unavailableReason && rev.rating == null && rev.count == null" class="new-hist">
+          <Icon name="info" :size="18" />
+          <div>
+            <b>没有读到评论</b>
+            <p class="faint small">{{ rev.unavailableReason }}</p>
+          </div>
+        </div>
+        <template v-else>
+          <div class="shop-grid">
+            <span v-if="rev.rating != null"><small>评分</small><b class="num">★ {{ rev.rating.toFixed(1) }}</b></span>
+            <span v-if="rev.count != null"><small>评论数</small><b class="num">{{ compactNum(rev.count) }}</b></span>
+            <span v-if="rev.goodRate != null"><small>好评率</small><b class="num">{{ Math.round(rev.goodRate) }}%</b></span>
+          </div>
+          <p v-if="rev.matchNote" class="match-note"><Icon name="target" :size="14" />{{ rev.matchNote }}</p>
+          <div class="pc">
+            <div v-if="rev.pros.length">
+              <small class="ok-t">优点</small>
+              <ul><li v-for="x in rev.pros" :key="x">{{ x }}</li></ul>
+            </div>
+            <div v-if="rev.cons.length">
+              <small class="warn-t">缺点</small>
+              <ul><li v-for="x in rev.cons" :key="x">{{ x }}</li></ul>
+            </div>
+          </div>
+          <div v-if="rev.redFlags.length" class="banner" style="background: var(--err-bg); color: var(--err)">
+            <Icon name="warn" />风险信号：{{ rev.redFlags.join("、") }}
+          </div>
+          <div v-if="rev.snippets.length" class="snips">
+            <small class="faint">代表评论</small>
+            <blockquote v-for="x in rev.snippets" :key="x" class="selectable">{{ x }}</blockquote>
+          </div>
+          <p v-if="rev.shopNote" class="small"><Icon name="shop" :size="13" /> 店铺评价：{{ rev.shopNote }}</p>
+          <p v-if="rev.unavailableReason" class="faint tiny">{{ rev.unavailableReason }}</p>
+        </template>
+      </section>
 
       <section v-if="deal && !provisional" class="glass card deal-box">
         <div class="card-head">
@@ -323,6 +443,191 @@ function ask() {
 }
 .btn.fb:hover {
   color: var(--err);
+}
+.big-score {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+}
+.big-score b {
+  font-size: 22px;
+}
+.big-score small {
+  color: var(--text-3);
+  font-size: 11px;
+}
+.big-score.green b,
+.cred.green b {
+  color: var(--ok);
+}
+.big-score.blue b,
+.cred.blue b {
+  color: var(--brand-ink);
+}
+.big-score.orange b,
+.cred.orange b {
+  color: var(--warn);
+}
+.big-score.red b,
+.cred.red b {
+  color: var(--err);
+}
+.cred {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.cred b {
+  font-size: 15px;
+}
+.parts {
+  display: grid;
+  gap: 6px;
+}
+.part {
+  display: grid;
+  grid-template-columns: 116px 1fr 34px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+}
+.pl {
+  color: var(--text-2);
+}
+.pbar,
+.rbar {
+  height: 7px;
+  border-radius: 4px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.pbar i,
+.rbar i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--text-3);
+  transition: width 600ms var(--spring-soft);
+}
+.pbar i.green,
+.rbar i.green {
+  background: var(--ok);
+}
+.pbar i.blue {
+  background: var(--brand);
+}
+.pbar i.orange,
+.rbar i.orange {
+  background: var(--warn);
+}
+.pbar i.red,
+.rbar i.red {
+  background: var(--err);
+}
+.pv {
+  text-align: right;
+  font-weight: 650;
+}
+.risk-box.high {
+  border-color: color-mix(in srgb, var(--err) 35%, transparent);
+}
+.factors {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+.factors li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.factors li.up {
+  color: var(--warn);
+}
+.factors li.down {
+  color: var(--ok);
+}
+.factors li span:first-of-type {
+  color: var(--text);
+  flex: 1;
+}
+.shop-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.shop-grid > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--hover);
+  min-width: 84px;
+  max-width: 220px;
+}
+.shop-grid small {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.shop-grid b {
+  font-size: 14px;
+}
+.notes {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  display: grid;
+  gap: 2px;
+}
+.match-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--brand-ink);
+  font-weight: 600;
+}
+.pc {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+.pc ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  display: grid;
+  gap: 2px;
+}
+.ok-t {
+  color: var(--ok);
+  font-weight: 650;
+}
+.warn-t {
+  color: var(--warn);
+  font-weight: 650;
+}
+.snips {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+.snips blockquote {
+  margin: 0;
+  padding: 7px 12px;
+  border-left: 3px solid var(--line-2);
+  border-radius: 0 10px 10px 0;
+  background: var(--hover);
+  font-size: 12.5px;
+  color: var(--text-2);
 }
 .watch-box {
   border-color: rgba(255, 176, 32, 0.3);

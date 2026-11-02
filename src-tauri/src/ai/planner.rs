@@ -78,6 +78,7 @@ pub fn rule_plan(instruction: &str, h: &RuleHints, ctx: &PlanCtx) -> SearchPlan 
         currency: h.currency.clone().unwrap_or_else(|| ctx.settings.display_currency.clone()),
         condition: h.condition.clone().unwrap_or_else(|| "any".into()),
         platforms: h.platforms.clone(),
+        platforms_explicit: !h.platforms.is_empty(),
         sort: h.sort.clone().unwrap_or_else(|| "relevance".into()),
         limit: h.limit.unwrap_or(ctx.settings.search.result_limit),
         monitor: h.monitor_minutes.map(|m| MonitorHint { interval_minutes: m, target_price: h.target_price }),
@@ -96,7 +97,7 @@ pub async fn plan(ai: &AiClient, instruction: &str, ctx: &PlanCtx<'_>) -> AppRes
     let h = rules::parse(instruction);
     let catalog: Vec<Value> = ctx
         .enabled()
-        .map(|p| json!({"id": p.id, "name": format!("{} {}", p.name, p.edition), "region": p.region, "lang": p.locale, "currency": p.currency, "kind": p.kind}))
+        .map(|p| json!({"id": p.id, "name": format!("{} {}", p.name, p.edition), "region": p.region, "lang": p.locale, "currency": p.currency, "kind": p.kind, "needsLogin": p.login == "required"}))
         .collect();
     let region_pref = h.region.clone().unwrap_or_else(|| ctx.settings.search.default_region.clone());
     let user = json!({
@@ -144,6 +145,8 @@ pub fn merge(instruction: &str, h: &RuleHints, v: &Value, ctx: &PlanCtx) -> Sear
         currency: h.currency.clone().or_else(|| s(&v["currency"])).unwrap_or_else(|| ctx.settings.display_currency.clone()),
         condition: one_of(h.condition.clone().or_else(|| s(&v["condition"])), &["any", "new", "used"], "any"),
         platforms: if h.platforms.is_empty() { list(&v["platforms"]) } else { h.platforms.clone() },
+        // 用户在指令里点名了平台 → 视为"指定平台"（v26.03：指定平台必须先登录）
+        platforms_explicit: !h.platforms.is_empty(),
         queries: v["queries"]
             .as_array()
             .map(|a| {

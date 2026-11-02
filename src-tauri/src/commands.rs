@@ -126,6 +126,13 @@ pub fn ai_presets() -> Vec<AiPreset> {
     presets::list()
 }
 
+/// v26.03：调用服务商的 GET /models 列出当前可用模型（input 为空时使用已保存的配置与 Key）。
+#[tauri::command]
+pub async fn ai_list_models(state: S<'_>, input: Option<AiConfigInput>) -> AppResult<ModelList> {
+    let ai = state.ai.clone();
+    Ok(ai.list_models(input).await)
+}
+
 #[tauri::command]
 pub fn ai_usage(state: S<'_>) -> AppResult<AiUsage> {
     let c = state.db.conn();
@@ -173,6 +180,23 @@ pub async fn login_states(state: S<'_>, refresh: bool) -> AppResult<Vec<LoginSta
     Ok(st.logins.refresh(&st.db, &st.browser, refresh).await)
 }
 
+/// v26.03：搜索前登录预检。verify = true 时先从会话备份恢复缺失的登录，再对超过 20 分钟未验证的平台
+/// 做一次主动验证（隐藏标签打开账号页，最多 3 个并行）。
+#[tauri::command]
+pub async fn login_preflight(app: AppHandle, state: S<'_>, platform_ids: Vec<String>, verify: bool) -> AppResult<Vec<LoginCheck>> {
+    let st = state.inner().clone();
+    Ok(st.logins.preflight(Some(&app), &st.db, &st.browser, &platform_ids, verify, false).await)
+}
+
+/// v26.03：登录体检——对所有已启用、需要登录的平台做一次主动验证。
+#[tauri::command]
+pub async fn login_check_all(app: AppHandle, state: S<'_>) -> AppResult<Vec<LoginState>> {
+    let st = state.inner().clone();
+    let ids: Vec<String> = platforms::all(&st.db).into_iter().filter(|p| p.enabled && p.login != "optional").map(|p| p.id).collect();
+    st.logins.preflight(Some(&app), &st.db, &st.browser, &ids, true, true).await;
+    Ok(st.logins.states(&st.db))
+}
+
 #[tauri::command]
 pub fn login_start(app: AppHandle, state: S<'_>, platform_id: String) -> LoginState {
     let st = state.inner();
@@ -215,7 +239,8 @@ pub async fn browser_show(state: S<'_>) -> AppResult<()> {
 pub async fn browser_wipe(app: AppHandle, state: S<'_>) -> AppResult<()> {
     let st = state.inner().clone();
     st.browser.wipe_profile().await.map_err(AppError::browser)?;
-    st.db.conn().execute("UPDATE login_meta SET has_auth=0, verified_at=NULL, cookie_expires=NULL", [])?;
+    st.db.conn().execute("UPDATE login_meta SET has_auth=0, verified_at=NULL, cookie_expires=NULL, checked_at=NULL, probe_ok=NULL", [])?;
+    crate::browser::vault::clear_all(&st.db);
     for s in st.logins.states(&st.db) {
         let _ = tauri::Emitter::emit(&app, "login://state", s);
     }
@@ -223,6 +248,30 @@ pub async fn browser_wipe(app: AppHandle, state: S<'_>) -> AppResult<()> {
 }
 
 /* ------------------------------------------------------------------ search */
+/// v26.03：用户指定的平台（选择器 / 指令点名）里，"必须登录"的平台没登录时不允许开始搜索。
+/// 只看本机记录的状态，不做主动验证（保持开始搜索足够快；界面在开始前已用 login_preflight 做过验证）。
+fn check_explicit_logins(st: &AppState, instruction: &str, plan: Option<&SearchPlan>) -> AppResult<()> {
+    let explicit: Vec<String> = match plan {
+        Some(p) if p.platforms_explicit => p.platforms.clone(),
+        Some(_) => vec![],
+        None => rules::parse(instruction).platforms,
+    };
+    if explicit.is_empty() {
+        return Ok(());
+    }
+    let all = platforms::all(&st.db);
+    let states = st.logins.states(&st.db);
+    let blocked: Vec<&platforms::Platform> = explicit
+        .iter()
+        .filter_map(|id| all.iter().find(|p| &p.id == id))
+        .filter(|p| p.login == "required" && states.iter().find(|s| s.platform_id == p.id).is_none_or(|s| s.status != "logged_in"))
+        .collect();
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    Err(AppError::login_required(&blocked.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), blocked.iter().map(|p| p.id.clone()).collect()))
+}
+
 #[tauri::command]
 pub async fn search_plan(state: S<'_>, instruction: String) -> AppResult<SearchPlan> {
     let st = state.inner().clone();
@@ -240,6 +289,7 @@ pub async fn search_plan(state: S<'_>, instruction: String) -> AppResult<SearchP
 
 #[tauri::command]
 pub fn search_start(app: AppHandle, state: S<'_>, instruction: String, plan: Option<SearchPlan>) -> AppResult<StartResult> {
+    check_explicit_logins(state.inner(), &instruction, plan.as_ref())?;
     let (h, plan, _rx) = pipeline::start(state.inner(), Some(app), instruction, plan, "manual", None)?;
     Ok(StartResult { run_id: h.id.clone(), plan })
 }
@@ -503,8 +553,17 @@ pub fn run_export(app: AppHandle, state: S<'_>, run_id: String, format: String) 
         }
         out.push_str(&format!("（到手价已换算为 {}，含运费与券后价）\n\n", s.display_currency));
         for (i, r) in items.iter().take(15).enumerate() {
+            let extra: Vec<String> = [
+                r.tags.iter().map(|t| t.label.clone()).collect::<Vec<_>>().join("/"),
+                r.risk.as_ref().map(|x| format!("风险{}", risk_cn(&x.level))).unwrap_or_default(),
+                r.review_insight.as_ref().and_then(|v| v.score).map(|sc| format!("评论 {sc}")).unwrap_or_default(),
+                r.final_score.map(|f| format!("综合 {f}")).unwrap_or_default(),
+            ]
+            .into_iter()
+            .filter(|x| !x.is_empty())
+            .collect();
             out.push_str(&format!(
-                "{}. {} | {} | 到手 {} {} | 标价 {} {} | {}\n   {}\n",
+                "{}. {} | {} | 到手 {} {} | 标价 {} {} | {}{}\n   {}\n",
                 i + 1,
                 pname(&r.platform_id),
                 r.title.chars().take(50).collect::<String>(),
@@ -513,6 +572,7 @@ pub fn run_export(app: AppHandle, state: S<'_>, run_id: String, format: String) 
                 r.currency,
                 money(r.price),
                 r.deal.as_ref().map(|x| x.label.clone()).unwrap_or_default(),
+                if extra.is_empty() { String::new() } else { format!(" | {}", extra.join(" · ")) },
                 r.url
             ));
         }
@@ -521,10 +581,10 @@ pub fn run_export(app: AppHandle, state: S<'_>, run_id: String, format: String) 
     let dir = state.data_dir.join("exports");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("search-{}.csv", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-    let mut out = String::from("\u{feff}排名,平台,标题,标价,币种,运费,券后价,到手价,到手价(显示币种),匹配,匹配分,价格判断,店铺,链接\n");
+    let mut out = String::from("\u{feff}排名,平台,标题,标价,币种,运费,券后价,到手价,到手价(显示币种),匹配,匹配分,价格判断,店铺,店铺类型,店铺可信度,风险等级,风险分,风险说明,评论分,评论数,标签,综合分,链接\n");
     for r in items {
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             r.rank,
             csv_escape(&pname(&r.platform_id)),
             csv_escape(&r.title),
@@ -538,12 +598,30 @@ pub fn run_export(app: AppHandle, state: S<'_>, run_id: String, format: String) 
             r.match_info.score,
             r.deal.as_ref().map(|x| x.label.clone()).unwrap_or_default(),
             csv_escape(r.shop.as_deref().unwrap_or("")),
+            r.shop_info.as_ref().map(|x| x.label.clone()).unwrap_or_default(),
+            r.shop_info.as_ref().map(|x| x.credibility.to_string()).unwrap_or_default(),
+            r.risk.as_ref().map(|x| risk_cn(&x.level).to_string()).unwrap_or_default(),
+            r.risk.as_ref().map(|x| x.score.to_string()).unwrap_or_default(),
+            csv_escape(r.risk.as_ref().map(|x| x.summary.as_str()).unwrap_or("")),
+            r.review_insight.as_ref().and_then(|v| v.score).map(|v| v.to_string()).unwrap_or_default(),
+            r.review_insight.as_ref().and_then(|v| v.count).map(|v| v.to_string()).unwrap_or_default(),
+            csv_escape(&r.tags.iter().map(|t| t.label.clone()).collect::<Vec<_>>().join("/")),
+            r.final_score.map(|v| v.to_string()).unwrap_or_default(),
             csv_escape(&r.url)
         ));
     }
     std::fs::write(&path, out)?;
     let _ = app.opener().reveal_item_in_dir(&path);
     Ok(path.display().to_string())
+}
+
+fn risk_cn(level: &str) -> &'static str {
+    match level {
+        "low" => "低",
+        "medium" => "中",
+        "high" => "高",
+        _ => "-",
+    }
 }
 
 /// 检测本机 AI 服务（Ollama / LM Studio），用于零成本上手。

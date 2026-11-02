@@ -15,6 +15,7 @@ pub fn spawn(state: AppState, app: AppHandle) {
         let watch_sem = Arc::new(Semaphore::new(2));
         let monitor_busy = Arc::new(AtomicBool::new(false));
         let mut last_keepalive = Instant::now();
+        let mut last_vault = Instant::now();
         loop {
             // 汇率
             if state.fx.needs_refresh(&state.db) {
@@ -79,11 +80,25 @@ pub fn spawn(state: AppState, app: AppHandle) {
             }
             // 保活
             let s = settings::load(&state.db);
+            // v26.03：每 30 分钟把已登录平台的会话加密备份一次（浏览器在运行、没有搜索时；只读 Cookie，不打开页面）
+            if last_vault.elapsed() > Duration::from_secs(30 * 60) && state.runs.running().is_empty() {
+                last_vault = Instant::now();
+                let st = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    // 只备份已验证登录、且没有正在登录的平台（登录到一半的会话不备份）
+                    let candidates = st.logins.backup_candidates(&st.db);
+                    let ps: Vec<&crate::platforms::Platform> = candidates.iter().collect();
+                    let saved = crate::browser::vault::snapshot(&st.db, &st.browser, &ps).await;
+                    if !saved.is_empty() {
+                        log::info!("session vault refreshed: {saved:?}");
+                    }
+                });
+            }
             if s.search.keepalive && last_keepalive.elapsed() > Duration::from_secs(6 * 3600) && state.runs.running().is_empty() {
                 last_keepalive = Instant::now();
                 let st = state.clone();
                 tauri::async_runtime::spawn(async move {
-                    let touched = browser::keepalive(&st.db, &st.browser).await;
+                    let touched = browser::keepalive(&st.db, &st.browser, &st.logins).await;
                     if !touched.is_empty() {
                         log::info!("keepalive: {:?}", touched);
                     }

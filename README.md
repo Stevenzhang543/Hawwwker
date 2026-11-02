@@ -1,7 +1,7 @@
-# Hawwwker 货客 · v26.02
+# Hawwwker 货客 · v26.03
 
 AI 多平台购物搜索、比价与盯价桌面应用（Tauri 2 + Vue 3 + TypeScript）。
-完整设计见 `docs/开发手册-v26.02.md`；本版改动见 `docs/releases/v26.02/RELEASE_NOTES.md`。
+完整设计见 `docs/开发手册-v26.03.md`；本版改动见 `docs/releases/v26.03/RELEASE_NOTES.md`。
 
 ## 快速开始（Windows）
 
@@ -17,7 +17,7 @@ scripts\build.bat      :: 打包：生成 exe 与安装包
 打包产物：
 
 - 免安装程序：`src-tauri\target\release\hawwwker.exe`
-- 安装包：`src-tauri\target\release\bundle\nsis\Hawwwker_26.2.0_x64-setup.exe`（以及 `msi\`）
+- 安装包：`src-tauri\target\release\bundle\nsis\Hawwwker_26.3.0_x64-setup.exe`（以及 `msi\`）
 
 只想看界面：`npm install && npm run dev`，用浏览器打开 http://localhost:1420（自动使用模拟数据；`?onboarding=1` 预览引导，`?noai=1` 预览 AI 未连接时的拦截，`?ollama=1` 模拟检测到本机模型）。`npm run build:web` 生成可双击打开的单文件网页预览版（`dist-web/index.html`）。
 
@@ -25,7 +25,7 @@ scripts\build.bat      :: 打包：生成 exe 与安装包
 
 ```bash
 # Linux 交叉编译 Windows（需要 mingw-w64、makensis、x86_64-pc-windows-gnu 标准库）
-scripts/release.sh 26.02 <证据目录>
+scripts/release.sh 26.03 <证据目录>
 ```
 
 输出到 `../releases/v<版本>/`，命名固定为：`README.md`、`RELEASE_NOTES.md`、`SHA256SUMS.txt`、`THIRD_PARTY_NOTICES.md`、`Hawwwker-v<版本>-release-evidence.zip`、`-source.zip`、`-web.zip`、`-windows-x64-portable.exe`、`-windows-x64-setup.exe`。说明文档取自 `docs/releases/v<版本>/`，便携版启动器脚本在 `src-tauri/portable/portable.nsi`。

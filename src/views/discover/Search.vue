@@ -2,17 +2,18 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, openExternal, toAppError } from "@/api";
-import type { LinkInfo, Region, ResultItem, SearchPlan, Verdict } from "@/api/types";
+import type { LinkInfo, Region, ResultItem, SearchPlan, SearchPrefs, ShopKind, Verdict } from "@/api/types";
 import { useAppStore } from "@/stores/app";
 import { itemKey, useSearchStore, visibleItems } from "@/stores/search";
 import { usePlatformStore } from "@/stores/platforms";
 import { useUiStore } from "@/stores/ui";
 import { useWatchStore } from "@/stores/watch";
 import { useCopilotStore } from "@/stores/copilot";
-import { useActions } from "@/composables/actions";
+import { useActions, RESULTS_OP_EVENT } from "@/composables/actions";
 import { EXAMPLES, VERDICT, RUN_STATUS, CONDITION } from "@/utils/labels";
 import { ago, copyText, money } from "@/utils/format";
 import { hasLandedInfo, isUrl, landedChips, landedDisplay } from "@/utils/landed";
+import { OFFICIAL_KINDS, RISK_LEVEL, SHOP_KIND_LABEL, TONE_CHIP, cardTags, isHighRisk, itemTags, reviewChip, riskTitle, scoreTone, shopKindOf } from "@/components/search/insight";
 import CommandBox from "@/components/search/CommandBox.vue";
 import PlatformPicker from "@/components/search/PlatformPicker.vue";
 import LiveActivity from "@/components/search/LiveActivity.vue";
@@ -46,7 +47,7 @@ const busy = ref(false);
 const view = ref<"card" | "list" | "table">("card");
 const fVerdict = ref<"good" | "all" | "exact">("good");
 const filters = ref<ResultFilters>(blankFilters());
-const sort = ref<"rank" | "price_asc" | "price_desc" | "score">("rank");
+const sort = ref<"rank" | "final" | "risk" | "price_asc" | "price_desc" | "score">("rank");
 const showHidden = ref(false);
 const detailKey = ref<string | null>(null);
 const cmdBox = ref<InstanceType<typeof CommandBox> | null>(null);
@@ -98,9 +99,30 @@ function closeCmd() {
 }
 const showFullCmd = computed(() => !hasRun.value || cmdOpen.value);
 const scopeLabel = computed(() => {
-  if (selected.value.length) return selected.value.length <= 2 ? selected.value.map((id) => platforms.label(id)).join("、") : `${selected.value.length} 个平台`;
-  return region.value === "all" ? "AI 选平台" : region.value === "cn" ? "国内版" : "国际版";
+  const scope = selected.value.length
+    ? selected.value.length <= 2 ? selected.value.map((id) => platforms.label(id)).join("、") : `${selected.value.length} 个平台`
+    : region.value === "all" ? "AI 选平台" : region.value === "cn" ? "国内版" : "国际版";
+  return `${scope} · ${DEPTH_LABEL[depth.value]}`;
 });
+
+/* ---------------- 检索深度（v26.03）：保存为默认值，本次与之后的搜索都按它执行 */
+type Depth = SearchPrefs["depth"];
+const DEPTH_LABEL: Record<Depth, string> = { quick: "快速", standard: "标准", deep: "深入" };
+const depth = computed<Depth>(() => app.settings?.search.depth ?? "standard");
+const depthOpts = computed(() => [
+  { value: "quick" as const, label: "快速", title: "只做匹配、风险与店铺分析，不打开商品页读评论（最快）" },
+  { value: "standard" as const, label: "标准", title: `为排名靠前的 ${app.settings?.search.reviewTop ?? 6} 件商品读取评论并分析（推荐）` },
+  { value: "deep" as const, label: "深入", title: "读取更多商品的评论与店铺评价，耗时更长" },
+]);
+async function setDepth(v: Depth) {
+  if (v === depth.value) return;
+  try {
+    await app.update({ search: { depth: v } as Partial<SearchPrefs> });
+    ui.toast(`检索深度：${DEPTH_LABEL[v]}`, "info", 1600, depthOpts.value.find((o) => o.value === v)?.title);
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  }
+}
 
 /* ---------------- 粘贴商品链接 */
 const linkUrl = computed(() => (isUrl(text.value) ? text.value.trim() : ""));
@@ -115,6 +137,20 @@ watch(linkUrl, (u) => {
   linkTimer = window.setTimeout(() => void inspect(u), 450);
 });
 onBeforeUnmount(() => window.clearTimeout(linkTimer));
+
+/** Copilot 对当前结果的界面操作（只看精确匹配 / 按到手价排序），见 composables/actions.ts */
+function onResultsOp(e: Event) {
+  const op = (e as CustomEvent<{ op: string }>).detail?.op;
+  if (op === "filter_exact") {
+    fVerdict.value = "exact";
+    e.preventDefault();
+  } else if (op === "sort_landed") {
+    sort.value = "price_asc";
+    e.preventDefault();
+  }
+}
+onMounted(() => window.addEventListener(RESULTS_OP_EVENT, onResultsOp));
+onBeforeUnmount(() => window.removeEventListener(RESULTS_OP_EVENT, onResultsOp));
 
 async function inspect(url: string) {
   if (link.url === url && (link.info || link.loading)) return;
@@ -175,15 +211,22 @@ async function go(instruction?: string, plan?: SearchPlan) {
   }
   busy.value = true;
   try {
+    let runId: string | null;
     if (plan) {
-      await search.start(t || plan.instruction, plan);
+      runId = await search.start(t || plan.instruction, plan);
     } else if (selected.value.length || region.value !== "all") {
-      const ids = selected.value.length ? selected.value : platforms.enabled.filter((p) => p.region === region.value).map((p) => p.id);
+      // 在选择器里逐个选的平台 = 指定平台：需要登录的平台必须先登录（v26.03）；只选地区则由 AI 判定并跳过未登录平台
+      const explicit = selected.value.length > 0;
+      const ids = explicit ? selected.value : platforms.enabled.filter((p) => p.region === region.value).map((p) => p.id);
       if (!ids.length) throw { code: "INVALID", message: "该地区没有启用的平台，请到「平台目录」启用" };
       ui.toast("AI 正在理解你的需求…", "ai", 2000);
-      await search.planThenStart(t, ids, (id) => (platforms.byId[id]?.locale ?? "zh").slice(0, 2));
+      runId = await search.planThenStart(t, ids, (id) => (platforms.byId[id]?.locale ?? "zh").slice(0, 2), explicit);
     } else {
-      await search.start(t);
+      runId = await search.start(t);
+    }
+    if (!runId) {
+      ui.toast("未开始搜索", "info", 2600, "所选平台需要先登录；登录后再搜索即可");
+      return;
     }
     cmdOpen.value = false;
     if (route.query.run) void router.replace({ query: {} });
@@ -236,7 +279,45 @@ async function saveMonitor(plan: SearchPlan) {
 /* ---------------- 结果筛选（价格一律按到手价） */
 const price = (r: ResultItem) => landedDisplay(r, app.toDisplay);
 const marked = (r: ResultItem) => r.feedback === "irrelevant";
-const shown = computed(() => items.value.filter((r) => r.match.verdict !== "mismatch" && !marked(r)));
+/** v26.03：开启"自动折叠高风险"时，高风险商品放进折叠区并写明原因 */
+const hideRisk = computed(() => app.settings?.search.hideHighRisk ?? true);
+const foldedRisk = (r: ResultItem) => hideRisk.value && isHighRisk(r);
+const shown = computed(() => items.value.filter((r) => r.match.verdict !== "mismatch" && !marked(r) && !foldedRisk(r)));
+const shopKinds = computed(() => {
+  const m = new Map<string, number>();
+  for (const r of shown.value) {
+    const k = shopKindOf(r);
+    if (k) m.set(k, (m.get(k) ?? 0) + 1);
+  }
+  const order = (k: string) => (OFFICIAL_KINDS.includes(k as ShopKind) ? 0 : 1);
+  return [...m.entries()]
+    .sort((a, b) => order(a[0]) - order(b[0]) || b[1] - a[1])
+    .map(([kind, count]) => ({ kind, label: SHOP_KIND_LABEL[kind as ShopKind] ?? kind, count }));
+});
+const hasRisk = computed(() => items.value.some((r) => r.risk));
+function hiddenReason(r: ResultItem): string | null {
+  if (marked(r)) return null;
+  if (r.match.verdict === "mismatch") return null;
+  if (foldedRisk(r)) return `高风险：${r.risk?.summary || r.risk?.factors.filter((f) => f.weight > 0).map((f) => f.label).slice(0, 2).join("、") || "建议谨慎"}`;
+  return null;
+}
+
+/* ---------------- 补充阶段指示：评论检索 / 分析进行中时，标出正在处理的靠前商品 */
+const pendingKeys = computed(() => {
+  const r = run.value;
+  if (!r || r.status !== "running" || !r.results.length) return new Map<string, string>();
+  const stage = r.stage;
+  const m = new Map<string, string>();
+  const top = [...r.results]
+    .filter((x) => x.match.verdict !== "mismatch")
+    .sort((a, b) => a.rank - b.rank)
+    .slice(0, app.settings?.search.depth === "deep" ? Math.max(12, app.settings.search.reviewTop) : app.settings?.search.reviewTop ?? 6);
+  if (stage === "reviews") for (const x of top) if (!x.reviewInsight) m.set(itemKey(x), "评论读取中…");
+  if (stage === "review_ai") for (const x of top) if (x.reviewInsight && !x.reviewInsight.aiChecked && x.reviewInsight.source !== "none") m.set(itemKey(x), "AI 分析评论中…");
+  if (stage === "risk") for (const x of r.results) if (!x.risk) m.set(itemKey(x), "风险分析中…");
+  if (stage === "shop") for (const x of r.results) if (!x.shopInfo) m.set(itemKey(x), "评估店铺…");
+  return m;
+});
 const resultPlatforms = computed(() => [...new Set(items.value.map((r) => r.platformId))]);
 const counts = computed(() => {
   const c: Record<string, number> = {};
@@ -256,17 +337,23 @@ const filtered = computed(() => {
   if (max != null) out = out.filter((r) => (price(r) ?? Infinity) <= max);
   if (f.freeShip) out = out.filter((r) => r.shipping === 0);
   if (f.goodDeal) out = out.filter((r) => r.deal?.level === "lowest" || r.deal?.level === "low");
+  if (f.risk === "no_high") out = out.filter((r) => r.risk?.level !== "high");
+  else if (f.risk === "low") out = out.filter((r) => r.risk?.level === "low");
+  if (f.shops.length) out = out.filter((r) => f.shops.includes(shopKindOf(r) ?? "unknown"));
   const s = [...out];
-  if (sort.value === "price_asc") s.sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15));
+  if (sort.value === "final") s.sort((a, b) => (b.finalScore ?? -1) - (a.finalScore ?? -1) || a.rank - b.rank);
+  else if (sort.value === "risk") s.sort((a, b) => (a.risk?.score ?? 50) - (b.risk?.score ?? 50) || (b.finalScore ?? 0) - (a.finalScore ?? 0));
+  else if (sort.value === "price_asc") s.sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15));
   else if (sort.value === "price_desc") s.sort((a, b) => (price(b) ?? -1) - (price(a) ?? -1));
   else if (sort.value === "score") s.sort((a, b) => b.match.score - a.match.score);
   else s.sort((a, b) => a.rank - b.rank);
   return s;
 });
-const hidden = computed(() => items.value.filter((r) => r.match.verdict === "mismatch" || marked(r)));
+const hidden = computed(() => items.value.filter((r) => r.match.verdict === "mismatch" || marked(r) || foldedRisk(r)));
 const userMarked = computed(() => hidden.value.filter(marked).length);
+const riskFolded = computed(() => hidden.value.filter((r) => !marked(r) && r.match.verdict !== "mismatch" && foldedRisk(r)).length);
 const bestId = computed(() => run.value?.summary?.bestPick?.id ?? null);
-const showSkeleton = computed(() => running.value && !hasItems.value && ["extract", "verify", "rank", "search"].includes(run.value?.stage ?? ""));
+const showSkeleton = computed(() => running.value && !hasItems.value && ["extract", "verify", "rank", "search", "screen", "platforms"].includes(run.value?.stage ?? ""));
 const examples = computed(() => EXAMPLES[app.role] ?? EXAMPLES.consumer);
 const recent = computed(() => search.history.slice(0, 4));
 
@@ -399,6 +486,12 @@ const verdictOpts = [
       <div class="hero-row">
         <GSegmented v-model="region" :options="regionOpts" small />
         <PlatformPicker v-model="selected" :region="region" />
+        <span class="depth" title="检索深度：会保存为默认值（也可在「设置 · 通用」修改）">
+          <span class="faint tiny">深度</span>
+          <GSegmented :model-value="depth" :options="depthOpts" small @update:model-value="setDepth">
+            <template #option="{ option }"><span :title="(option as { title?: string }).title">{{ option.label }}</span></template>
+          </GSegmented>
+        </span>
         <span class="spacer"></span>
         <span class="faint tiny"><Icon name="shield" :size="13" /> 在你的登录会话中运行 · 全程可见、可取消</span>
       </div>
@@ -428,7 +521,7 @@ const verdictOpts = [
       </div>
 
       <div v-else key="run" class="stack run-stack">
-        <LiveActivity v-if="run" :run="run" :slim="hasItems" @cancel="cancel" @show-browser="showBrowser" />
+        <LiveActivity v-if="run" :run="run" :slim="hasItems" @cancel="cancel" @show-browser="showBrowser" @rerun="go(run.instruction || run.plan?.instruction)" />
         <PlanCard v-if="run?.plan" :plan="run.plan" :running="running" @rerun="(p) => go(p.instruction, p)" @monitor="saveMonitor" />
 
         <!-- 总结位：先用一条状态占位，总结到达后原位替换，不把结果往下推 -->
@@ -439,7 +532,8 @@ const verdictOpts = [
             <span v-if="provisional" class="small">
               已出 <b class="num">{{ items.length }}</b> 条初步结果（规则初判）· AI 正在逐条核对，完成后原位更新
             </span>
-            <span v-else class="small">AI 已核对完毕，正在写总结与推荐…</span>
+            <span v-else-if="run?.stage === 'summarize'" class="small">AI 已完成细筛，正在写总结与推荐…</span>
+            <span v-else class="small ellipsis">{{ run?.stageLabel || "处理中" }}… 完成后给出总结与推荐</span>
             <span class="spacer"></span>
             <span class="dots"><i></i><i></i><i></i></span>
           </div>
@@ -450,11 +544,20 @@ const verdictOpts = [
             <GSegmented v-model="fVerdict" :options="verdictOpts" small />
             <select v-model="sort" class="select sm" style="width: 132px" title="价格排序按到手价（券后 + 运费）">
               <option value="rank">综合排序</option>
+              <option value="final">综合推荐分</option>
+              <option value="risk">低风险优先</option>
               <option value="price_asc">到手价从低到高</option>
               <option value="price_desc">到手价从高到低</option>
               <option value="score">匹配度</option>
             </select>
-            <FilterPopover v-model="filters" :platforms="resultPlatforms" :currency="app.displayCurrency" :counts="counts" />
+            <FilterPopover
+              v-model="filters"
+              :platforms="resultPlatforms"
+              :currency="app.displayCurrency"
+              :counts="counts"
+              :shop-kinds="shopKinds"
+              :has-risk="hasRisk"
+            />
             <span class="spacer"></span>
             <span class="faint tiny">{{ filtered.length }} 条<template v-if="provisional"> · 初判</template></span>
             <button class="btn sm ghost" :disabled="!canExport" :title="canExport ? '复制为可粘贴的比价清单' : '搜索完成后可复制'" @click="copyList"><Icon name="copy" />复制清单</button>
@@ -474,6 +577,7 @@ const verdictOpts = [
               :key="itemKey(r)"
               :item="r"
               :best="r.id === bestId"
+              :pending="pendingKeys.get(itemKey(r)) ?? null"
               :style="{ '--i': Math.min(i, 12) }"
               @open="openDetail(r)"
               @watch="onWatch(r)"
@@ -495,10 +599,15 @@ const verdictOpts = [
                   <span v-if="r.id === bestId" class="chip amber">AI 推荐</span>
                   <DealBadge :deal="r.deal" compact />
                   <span v-for="c in landedChips(r)" :key="c.text" class="chip" :class="c.tone" :title="c.title">{{ c.text }}</span>
+                  <span v-if="r.risk" class="chip" :class="RISK_LEVEL[r.risk.level].tone" :title="riskTitle(r.risk)">{{ RISK_LEVEL[r.risk.level].label }} {{ r.risk.score }}</span>
+                  <span v-for="t in cardTags(r).slice(0, 2)" :key="t.kind + t.label" class="chip" :class="TONE_CHIP[t.tone] ?? ''">{{ t.label }}</span>
+                  <span v-if="reviewChip(r.reviewInsight)" class="chip" :class="reviewChip(r.reviewInsight)!.tone" :title="reviewChip(r.reviewInsight)!.title">{{ reviewChip(r.reviewInsight)!.text }}</span>
+                  <span v-if="pendingKeys.get(itemKey(r))" class="faint tiny"><Icon name="refresh" :size="11" class="spin" />{{ pendingKeys.get(itemKey(r)) }}</span>
                 </div>
                 <p class="ellipsis li-title">{{ r.title }}</p>
                 <p class="faint tiny ellipsis">{{ r.match.reasons.join(" · ") }}</p>
               </div>
+              <span v-if="r.finalScore != null" class="li-score" :class="scoreTone(r.finalScore)" title="综合分"><b class="num">{{ r.finalScore }}</b><small>综合</small></span>
               <PriceTag :price="r.price" :currency="r.currency" :display="r.displayPrice" :landed="r.landedPrice" :display-landed="r.displayLanded" :landed-label="hasLandedInfo(r)" />
               <div class="row" @click.stop>
                 <button class="btn sm" title="在平台中打开" @click="openExternal(r.url)"><Icon name="external" /></button>
@@ -512,26 +621,33 @@ const verdictOpts = [
             <table class="table">
               <thead>
                 <tr>
-                  <th>商品</th><th>平台</th><th class="r">标价</th><th class="r">到手价（{{ app.displayCurrency }}）</th><th>价格判断</th><th>匹配</th><th>成色</th><th>店铺</th><th></th>
+                  <th>商品</th><th>平台</th><th class="r">到手价（{{ app.displayCurrency }}）</th><th>匹配</th><th>风险</th><th>店铺</th><th>评论</th><th class="r">综合</th><th></th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="r in [...filtered].sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15))" :key="itemKey(r)" style="cursor: pointer" @click="openDetail(r)">
-                  <td style="max-width: 240px"><div class="ellipsis" :title="r.title">{{ r.title }}</div></td>
+                  <td style="max-width: 210px"><div class="ellipsis" :title="r.title">{{ r.title }}</div></td>
                   <td><PlatformBadge :id="r.platformId" /></td>
-                  <td class="r"><span class="price">{{ money(r.price, r.currency) }}</span></td>
                   <td class="r">
                     <span class="price" :class="{ amber: r.id === bestId }">{{ money(price(r), app.displayCurrency) }}</span>
-                    <div class="tiny faint">{{ landedChips(r).map((c) => c.text).join(" · ") }}</div>
+                    <div class="tiny faint" :title="`标价 ${money(r.price, r.currency)}`">{{ [money(r.price, r.currency), ...landedChips(r).map((c) => c.text)].join(" · ") }}</div>
+                    <DealBadge :deal="r.deal" compact />
                   </td>
-                  <td><DealBadge :deal="r.deal" compact /></td>
                   <td>
                     <span v-if="r.provisional" class="chip purple">核对中</span>
                     <span v-else class="chip" :class="VERDICT[r.match.verdict].tone">{{ VERDICT[r.match.verdict].label }}</span>
                   </td>
-                  <td class="faint nw">{{ CONDITION[r.condition] }}</td>
-                  <td class="faint nw"><div class="ellipsis" style="max-width: 96px" :title="r.shop ?? ''">{{ r.shop ?? "—" }}</div></td>
-                  <td class="r" @click.stop><button class="btn ghost sm" @click="openExternal(r.url)"><Icon name="external" />打开</button></td>
+                  <td class="nw">
+                    <span v-if="r.risk" class="chip" :class="RISK_LEVEL[r.risk.level].tone" :title="riskTitle(r.risk)">{{ RISK_LEVEL[r.risk.level].label }} {{ r.risk.score }}</span>
+                    <span v-else class="faint">{{ CONDITION[r.condition] }}</span>
+                  </td>
+                  <td class="nw">
+                    <span v-if="itemTags(r)[0]" class="chip" :class="TONE_CHIP[itemTags(r)[0]!.tone] ?? ''">{{ itemTags(r)[0]!.label }}</span>
+                    <div class="ellipsis faint tiny" style="max-width: 108px" :title="r.shop ?? r.shopInfo?.name ?? ''">{{ r.shop ?? r.shopInfo?.name ?? "—" }}</div>
+                  </td>
+                  <td class="faint tiny" style="max-width: 120px" :title="reviewChip(r.reviewInsight)?.title ?? ''">{{ reviewChip(r.reviewInsight)?.text ?? "—" }}</td>
+                  <td class="r"><b v-if="r.finalScore != null" class="num" :class="'t-' + scoreTone(r.finalScore)">{{ r.finalScore }}</b><span v-else class="faint">—</span></td>
+                  <td class="r" @click.stop><button class="icon-btn" title="在平台中打开" @click="openExternal(r.url)"><Icon name="external" :size="16" /></button></td>
                 </tr>
               </tbody>
             </table>
@@ -546,8 +662,8 @@ const verdictOpts = [
           <section v-if="hidden.length" class="hidden-box glass">
             <button class="hb-head" @click="showHidden = !showHidden">
               <Icon name="eye" :size="16" />
-              <b>可能不相关 {{ hidden.length }} 条</b>
-              <span class="faint small">AI 判断为配件、不同产品或广告<template v-if="userMarked">，含你标记的 {{ userMarked }} 条</template>，默认折叠以免干扰</span>
+              <b>{{ riskFolded ? "可能不相关 / 高风险" : "可能不相关" }} {{ hidden.length }} 条</b>
+              <span class="faint small">AI 判断为配件、不同产品或广告<template v-if="riskFolded">；高风险 {{ riskFolded }} 条（可在「设置 · 通用」关闭自动折叠）</template><template v-if="userMarked">，含你标记的 {{ userMarked }} 条</template>，默认折叠以免干扰</span>
               <span class="spacer"></span>
               <Icon name="down" :size="15" :style="{ transform: showHidden ? 'rotate(180deg)' : '', transition: 'transform .3s' }" />
             </button>
@@ -557,6 +673,7 @@ const verdictOpts = [
                   v-for="r in hidden"
                   :key="itemKey(r)"
                   :item="r"
+                  :hidden-reason="hiddenReason(r)"
                   @open="openDetail(r)"
                   @watch="onWatch(r)"
                   @copilot="ask(r)"
@@ -849,6 +966,40 @@ const verdictOpts = [
   background: transparent;
   cursor: pointer;
   text-align: left;
+}
+.depth {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.li-score {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  flex: none;
+}
+.li-score b {
+  font-size: 16px;
+}
+.li-score small {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.li-score.green b,
+.t-green {
+  color: var(--ok);
+}
+.li-score.blue b,
+.t-blue {
+  color: var(--brand-ink);
+}
+.li-score.orange b,
+.t-orange {
+  color: var(--warn);
+}
+.li-score.red b,
+.t-red {
+  color: var(--err);
 }
 .undo-wrap {
   position: fixed;

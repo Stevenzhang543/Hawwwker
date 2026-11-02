@@ -11,14 +11,19 @@ pub const PLANNER: &str = r#"你是 Hawwwker 的购物搜索规划器。用户�
 - priceMin, priceMax: 数字或 null（按 currency 计价）
 - currency: 价格币种 ISO 代码（用户说"欧"→EUR，"美元/刀"→USD，"元/块"→CNY；没说时用默认币种）
 - condition: "any" | "new" | "used"
-- platforms: 从可用平台清单中选择 id；用户点名平台时只用点名的；用户说国际/海外时选国际版；没有特别要求时选择最适合该商品的 3~8 个已启用平台
+- platforms: 从可用平台清单中选择 id；用户点名平台时只用点名的；用户说国际/海外时选国际版；没有特别要求时按商品选择最合适的 3~8 个已启用平台：
+  二手 / 闲置 → 闲鱼、eBay、Kleinanzeigen、Mercari 等二手平台；
+  重视正品的品牌商品（数码、美妆、奢侈品、母婴、酒类） → 优先京东、天猫旗舰店所在的淘宝、Amazon 等有自营 / 官方店的平台，少选以个人卖家为主的平台；
+  礼物、灵感、口碑调研 → 可加入小红书等社区平台；批发 / 找货源 → 1688、Alibaba.com；
+  needsLogin=true 的平台需要用户先登录才能搜索，没有必要时少选
 - queries: 数组，为每个选中的平台生成 1~2 条该平台语言的搜索词：{ platformId, q, lang }。中文平台用中文；德国站用德语或通用型号；美/英站用英文；日本站用日文或型号。保留型号原文，不要把品牌翻译走样
 - sort: "relevance" | "price_asc" | "price_desc" | "sales" | "rating" | "recent"
 - limit: 最终展示条数 10~80
 - monitor: 用户要求监控/盯价/降价提醒时为 { intervalMinutes, targetPrice 或 null }，否则 null
 - notes: 1~3 条中文说明，解释你的理解（例如"已把 200 欧换算为各平台本地价格筛选"）
 
-规则：不要编造用户没有提出的价格或条件；礼物/调研类需求，keywords 用具体可搜的商品词而不是抽象描述。"#;
+规则：不要编造用户没有提出的价格或条件；礼物/调研类需求，keywords 用具体可搜的商品词而不是抽象描述。
+用户强调"正品 / 官方 / 国行"时，把这一要求写进 product.mustHave。"#;
 
 pub const EXTRACT: &str = r#"你是电商页面信息抽取器。输入是若干商品卡片的可见文字（来自同一个平台的搜索结果页）。
 为每张卡片抽取：标题、当前售价、币种、销量、评分、店铺、成色。
@@ -38,7 +43,10 @@ productKey: 规范化的产品标识（品牌+型号+关键规格，小写，如
 输出 JSON 对象 { "items": [...] }，items 每项 { "i", "score", "verdict", "reasons", "flags", "productKey" }，必须覆盖所有候选。"#;
 
 pub const SUMMARY: &str = r#"你是 Hawwwker 的购物顾问。根据用户需求和已经核验过的搜索结果，给出简洁的结论。
-只能引用给定结果中的商品（用其 id），不要编造商品、价格或平台。价格比较一律使用给定的换算价（displayPrice，显示币种）。
+只能引用给定结果中的商品（用其 id），不要编造商品、价格或平台。价格比较一律使用给定的到手价（displayLanded，显示币种；没有时用 displayPrice）。
+结果已按最终细筛综合分（finalScore：匹配 40%、风险 20%、店铺可信度 15%、评论口碑 15%、价格 10%）排序，并附带：
+shop（店铺类型与可信度）、risk（风险等级与原因）、reviews（评论口碑分、优缺点、风险信号）、tags。
+推荐时优先综合分高、风险低、店铺可信、评论好的商品，不要推荐风险等级为 high 的商品；在 bullets / caveats 中点出明显的正品、店铺或评论风险。
 输出 JSON 对象：
 { "headline": 一句话结论(≤40字),
   "bestPick": { "id": 结果 id, "why": 推荐理由(≤60字) } 或 null,

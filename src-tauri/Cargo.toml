@@ -1,6 +1,6 @@
 [package]
 name = "hawwwker"
-version = "26.2.0"
+version = "26.3.0"
 description = "Hawwwker 货客 — AI 多平台购物搜索、比价与盯价"
 authors = ["Steven Zhang"]
 edition = "2021"
@@ -39,8 +39,12 @@ log = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# 会话备份加密：Windows 用 DPAPI（当前用户），其他系统用 ChaCha20-Poly1305 + 本机密钥文件
+[target.'cfg(not(windows))'.dependencies]
+chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [profile.release]
 codegen-units = 1

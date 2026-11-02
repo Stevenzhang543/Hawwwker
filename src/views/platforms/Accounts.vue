@@ -55,7 +55,7 @@ const stats = computed(() => {
 });
 
 function st(p: PlatformInfo): LoginState {
-  return store.logins[p.id] ?? { platformId: p.id, status: "unknown", flow: "idle", sharedWith: [] };
+  return store.logins[p.id] ?? { platformId: p.id, status: "unknown", flow: "idle" };
 }
 function tone(s: LoginState["status"]) {
   return s === "logged_in" ? "green" : s === "expired" ? "orange" : s === "logged_out" ? "red" : "";
@@ -63,13 +63,19 @@ function tone(s: LoginState["status"]) {
 const inFlow = (s: LoginState) => ["opening", "waiting", "verifying"].includes(s.flow);
 const FLOW: Record<string, string> = {
   opening: "正在打开官网登录页…",
-  waiting: "请在弹出的浏览器窗口中登录，完成后会自动识别",
-  verifying: "正在验证登录状态…",
-  success: "已登录并保存会话",
+  waiting: "请在弹出的浏览器窗口中登录，完成后会自动识别（会打开账号页确认）",
+  verifying: "检测到登录信息，正在确认…（请勿关闭窗口）",
+  success: "登录成功，会话已保存",
   cancelled: "已取消（窗口已关闭），可以重新登录",
-  timeout: "10 分钟内没有检测到登录，可以重新尝试",
+  timeout: "10 分钟内没有完成登录，可以重新尝试",
   failed: "登录检测失败",
 };
+/** 主动验证 / 刷新以来的时间说明 */
+function checkedText(s: LoginState): string {
+  const t = s.checkedAt ?? s.verifiedAt;
+  if (!t) return "已检测到会话";
+  return `${s.checkedAt ? "已验证" : "最近使用"} · ${ago(t)}`;
+}
 
 async function act(fn: () => Promise<void>) {
   try {
@@ -79,15 +85,37 @@ async function act(fn: () => Promise<void>) {
   }
 }
 async function logout(p: PlatformInfo) {
-  const s = st(p);
-  const shared = s.sharedWith.map((id) => store.label(id)).join("、");
   const ok = await ui.confirm(
     `退出 ${store.label(p.id)}？`,
-    shared ? `将删除本机保存的该账号会话。注意：${shared} 与它共享同一账号，也会一起退出。` : "将删除本机保存的该平台登录会话，不影响其他平台。",
+    "将删除本机保存的该平台登录会话与加密备份，不影响其他平台。",
     "退出",
     true,
   );
-  if (ok) await act(() => store.logout(p.id));
+  if (ok)
+    await act(async () => {
+      const s = await store.logout(p.id);
+      if (s.message) ui.toast(s.message, "success", 3200);
+    });
+}
+const verifying = ref<Record<string, boolean>>({});
+async function verifyOne(p: PlatformInfo) {
+  verifying.value = { ...verifying.value, [p.id]: true };
+  await act(async () => {
+    const s = await store.loginConfirm(p.id);
+    if (s.message && !inFlow(s)) ui.toast(s.message, s.status === "logged_in" ? "success" : "warn", 3600);
+  });
+  verifying.value = { ...verifying.value, [p.id]: false };
+}
+/** 登录体检：主动验证所有已启用、需要登录的平台 */
+async function checkAll() {
+  await act(async () => {
+    const states = await store.checkAll();
+    const need = states.filter((s) => store.byId[s.platformId]?.enabled && store.byId[s.platformId]?.login !== "optional");
+    const ok = need.filter((s) => s.status === "logged_in").length;
+    const bad = need.length - ok;
+    ui.toast(bad ? `登录体检：${ok} 个有效，${bad} 个需要登录` : `登录体检：${ok} 个平台登录都有效`, bad ? "warn" : "success", 4200, bad ? "可在「待处理」里一键登录" : undefined);
+    if (bad) scope.value = "todo";
+  });
 }
 async function refresh() {
   refreshing.value = true;
@@ -116,7 +144,7 @@ const regionOpts = [
     <div class="page-head">
       <div>
         <h1>账号与登录</h1>
-        <p>在官网登录一次，之后的搜索与盯价都复用这个会话。会话只保存在本机浏览器目录，Hawwwker 不读取、不上传。</p>
+        <p>在官网登录一次，之后的搜索与盯价都复用这个会话。每个平台独立登录、互不影响；会话只保存在本机（含加密备份，浏览器意外丢失登录时自动恢复），Hawwwker 不上传。</p>
       </div>
     </div>
 
@@ -133,6 +161,9 @@ const regionOpts = [
         <span class="dot green"></span>{{ stats.ok }}<span class="dot orange"></span>{{ stats.expired }}<span class="dot red"></span>{{ stats.out }}
       </span>
       <button class="btn sm" :disabled="refreshing" @click="refresh"><Icon name="refresh" :class="{ spin: refreshing }" />刷新状态</button>
+      <button v-ripple class="btn sm primary" :disabled="store.checkingAll" title="打开每个已登录平台的账号页，确认登录真的有效" @click="checkAll">
+        <Icon name="shield" :class="{ spin: store.checkingAll }" />{{ store.checkingAll ? "体检中…" : "登录体检" }}
+      </button>
     </div>
 
     <div v-if="!families.length" class="empty glass">
@@ -160,13 +191,12 @@ const regionOpts = [
             </div>
 
             <p class="ed-meta faint tiny">
-              <template v-if="st(p).status === 'logged_in'">{{ st(p).verifiedAt ? `${ago(st(p).verifiedAt)}验证` : "已检测到会话" }}<template v-if="st(p).cookieExpires"> · 会话约 {{ ago(st(p).cookieExpires) }}到期</template></template>
-              <template v-else-if="st(p).status === 'expired'">{{ st(p).message ?? "最近一次搜索遇到登录页" }}</template>
+              <template v-if="st(p).status === 'logged_in'">{{ checkedText(st(p)) }}<template v-if="st(p).cookieExpires"> · 会话约 {{ ago(st(p).cookieExpires) }}到期</template><span v-if="st(p).vaulted" class="vault" title="本机有加密的会话备份：浏览器意外丢失登录时会自动恢复"><Icon name="shield" :size="11" />已备份</span></template>
+              <template v-else-if="st(p).status === 'expired'">{{ st(p).message ?? "最近一次搜索或验证遇到登录页，需要重新登录" }}</template>
               <template v-else-if="st(p).status === 'not_needed'">该平台无需登录即可搜索{{ p.login === "optional" ? "，登录后可看到会员价" : "" }}</template>
               <template v-else-if="p.login === 'required'">需要登录才能搜索</template>
               <template v-else>建议登录以获得完整结果</template>
             </p>
-            <p v-if="st(p).sharedWith.length" class="shared tiny"><Icon name="link" :size="12" />与 {{ st(p).sharedWith.map((id) => store.label(id)).join("、") }} 共享账号</p>
 
             <Transition name="blur">
               <div v-if="inFlow(st(p)) || ['cancelled', 'timeout', 'failed', 'success'].includes(st(p).flow)" class="flowbox" :class="st(p).flow">
@@ -179,11 +209,11 @@ const regionOpts = [
 
             <div class="ed-actions">
               <template v-if="inFlow(st(p))">
-                <button v-ripple class="btn sm primary" :disabled="st(p).flow === 'verifying'" @click="act(() => store.loginConfirm(p.id))"><Icon name="check" />我已登录</button>
+                <button v-ripple class="btn sm primary" :disabled="st(p).flow === 'verifying'" @click="verifyOne(p)"><Icon name="check" />我已登录</button>
                 <button class="btn sm" @click="act(() => store.loginCancel(p.id))">取消</button>
               </template>
               <template v-else-if="st(p).status === 'logged_in'">
-                <button class="btn sm" @click="act(() => store.loginConfirm(p.id))"><Icon name="shield" />验证</button>
+                <button class="btn sm" :disabled="verifying[p.id]" title="打开账号页确认登录仍然有效" @click="verifyOne(p)"><Icon name="shield" :class="{ spin: verifying[p.id] }" />{{ verifying[p.id] ? "验证中…" : "验证" }}</button>
                 <button class="btn sm ghost danger" @click="logout(p)"><Icon name="logout" />退出</button>
               </template>
               <template v-else>
@@ -219,7 +249,7 @@ const regionOpts = [
         </template>
       </div>
       <p class="faint tiny" style="margin-top: 10px">
-        登录由你本人在官网完成，Hawwwker 拿不到密码；遇到验证码或安全验证时会把窗口移到屏幕上等你处理，不做任何绕过。退出某个平台只删除该平台的会话，不影响其他平台。
+        登录由你本人在官网完成，Hawwwker 拿不到密码；只有离开登录 / 验证页面、并打开账号页确认后才算登录成功。遇到验证码或安全验证时会把窗口移到屏幕上等你处理，不做任何绕过。退出某个平台只删除该平台的会话，不影响其他平台。
       </p>
     </section>
   </div>
@@ -337,11 +367,12 @@ const regionOpts = [
 .ed-meta {
   min-height: 18px;
 }
-.shared {
-  display: flex;
+.vault {
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
-  color: var(--purple);
+  gap: 3px;
+  margin-left: 8px;
+  color: var(--ok);
 }
 .flowbox {
   display: flex;

@@ -3,7 +3,10 @@
 pub mod filter;
 pub mod parse;
 pub mod pipeline;
+pub mod reviews;
+pub mod risk;
 pub mod rules;
+pub mod shop;
 
 use crate::models::{RunEvent, RunEventBody, RunEventPayload};
 use std::collections::HashMap;

@@ -56,7 +56,8 @@ async function open(id: string) {
 async function rerun(instruction: string) {
   try {
     await router.push("/discover/search");
-    await search.start(instruction);
+    const id = await search.start(instruction);
+    if (!id) ui.toast("未开始搜索", "info", 2600, "所选平台需要先登录；登录后再搜索即可");
   } catch (e) {
     ui.toast(toAppError(e).message, "error");
   }

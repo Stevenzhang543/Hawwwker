@@ -14,7 +14,7 @@ const emit = defineEmits<{ action: [CopilotAction]; open: [ResultItem] }>();
 const platforms = usePlatformStore();
 const headline = useTypewriter(toRef(() => props.summary.headline), 70);
 const best = computed(() => (props.summary.bestPick ? props.results.find((r) => r.id === props.summary.bestPick!.id) ?? null : null));
-const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch: "tag", open: "external", navigate: "arrow" };
+const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch: "tag", open: "external", navigate: "arrow", monitor: "clock", login: "login", setting: "gear", results: "list" };
 </script>
 
 <template>

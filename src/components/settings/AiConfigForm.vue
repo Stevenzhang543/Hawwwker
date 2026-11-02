@@ -72,10 +72,56 @@ onMounted(async () => {
 });
 
 const preset = computed(() => presets.value.find((p) => p.id === provider.value) ?? null);
+
+/* 获取模型列表（GET /models）：模型 ID 会随服务商更新，以服务商返回为准 */
+const remoteModels = ref<string[]>([]);
+const listing = ref(false);
+const listMsg = ref<string | null>(null);
+const modelOptions = computed(() => {
+  const rec = preset.value?.models ?? [];
+  const extra = remoteModels.value.filter((m) => !rec.includes(m));
+  return [...rec, ...extra];
+});
+async function fetchModels() {
+  listing.value = true;
+  listMsg.value = null;
+  try {
+    const r = await api.aiListModels({
+      protocol: protocol.value,
+      provider: provider.value,
+      baseUrl: baseUrl.value.trim(),
+      model: model.value.trim(),
+      apiKey: apiKey.value ? apiKey.value.trim() : undefined,
+    });
+    remoteModels.value = r.models;
+    listMsg.value = r.message ?? (r.models.length ? `服务商返回 ${r.models.length} 个可用模型` : "没有返回模型");
+  } catch (e) {
+    listMsg.value = toAppError(e).message;
+  } finally {
+    listing.value = false;
+  }
+}
+/** 已停用 / 不再推荐的模型：提示更换 */
+const retiredHint = computed(() => {
+  const r = new Set(preset.value?.retired ?? []);
+  const bad = [model.value, fastModel.value].map((m) => m.trim()).filter((m) => m && r.has(m));
+  if (!bad.length) return null;
+  const rec = preset.value?.models[0];
+  return `${bad.join("、")} 已停用或不再推荐${rec ? `，建议改为 ${rec}` : ""}`;
+});
+function useRecommended() {
+  const p = preset.value;
+  if (!p) return;
+  const r = new Set(p.retired ?? []);
+  if (r.has(model.value.trim())) model.value = p.models[0] ?? model.value;
+  if (r.has(fastModel.value.trim())) fastModel.value = p.fastModel && p.fastModel !== model.value ? p.fastModel : "";
+}
 function pick(p?: AiPreset) {
   if (!p) return;
   provider.value = p.id;
   protocol.value = p.protocol;
+  remoteModels.value = [];
+  listMsg.value = null;
   if (p.id !== "custom") {
     baseUrl.value = p.baseUrl;
     model.value = p.models[0] ?? "";
@@ -154,12 +200,25 @@ const REGION: Record<string, string> = { cn: "国内", intl: "国际", local: "�
       <label class="field">
         <span>主模型（规划 / 总结 / Copilot）</span>
         <input v-model="model" class="input" list="ai-models" placeholder="模型名称" />
-        <datalist id="ai-models"><option v-for="m in preset?.models ?? []" :key="m" :value="m" /></datalist>
+        <datalist id="ai-models"><option v-for="m in modelOptions" :key="m" :value="m" /></datalist>
       </label>
       <label class="field">
         <span>快速模型（抽取 / 校验，可选）</span>
         <input v-model="fastModel" class="input" list="ai-models" placeholder="留空则使用主模型" />
       </label>
+      <div class="field full models-row">
+        <button class="btn ghost sm" :disabled="listing || (!baseUrl && protocol !== 'anthropic')" title="向服务商查询当前账号可用的模型（GET /models）" @click="fetchModels">
+          <Icon :name="listing ? 'refresh' : 'list'" :class="{ spin: listing }" />{{ listing ? "获取中…" : "获取模型列表" }}
+        </button>
+        <span v-if="listMsg" class="tiny" :class="remoteModels.length ? 'muted' : 'warn-text'">{{ listMsg }}</span>
+        <div v-if="remoteModels.length" class="model-chips">
+          <button v-for="m in remoteModels.slice(0, 24)" :key="m" class="chip click" :class="{ blue: m === model }" @click="model = m">{{ m }}</button>
+        </div>
+      </div>
+      <div v-if="retiredHint" class="field full retired">
+        <Icon name="warn" :size="14" /><span>{{ retiredHint }}</span>
+        <button class="btn sm" @click="useRecommended">一键更换</button>
+      </div>
       <template v-if="showAdv || provider === 'custom'">
         <label class="field full">
           <span>Base URL</span>
@@ -211,6 +270,38 @@ const REGION: Record<string, string> = { cn: "国内", intl: "国际", local: "�
 </template>
 
 <style scoped>
+.models-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.model-chips {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 96px;
+  overflow: auto;
+}
+.warn-text {
+  color: var(--warn);
+}
+.retired {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--warn-bg);
+  color: var(--amber-ink, var(--text));
+  font-size: 12.5px;
+}
+.retired span {
+  flex: 1;
+}
 .local {
   display: flex;
   align-items: center;

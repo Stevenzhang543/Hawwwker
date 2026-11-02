@@ -9,11 +9,20 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SHOP: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Shop</title><style>.p{font-size:22px;font-weight:700}</style></head><body>
-<div><a href="/dp/B09Y2MYL5C"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B09Y2MYL5C">Sony WH-1000XM5 Kopfhörer Schwarz</a><div class="p">289,99 €</div></div>
+<div><a href="/dp/B09Y2MYL5C"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B09Y2MYL5C">Sony WH-1000XM5 Kopfhörer Schwarz</a><div class="p">289,99 €</div><div>索尼官方旗舰店</div></div>
 <div><a href="/dp/B0C1234567"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B0C1234567">Ohrpolster für Sony WH-1000XM5</a><div class="p">19,99 €</div></div>
-<div><a href="/dp/B0E1111111"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B0E1111111">Sony WH-1000XM5 Silber Neu</a><div class="p">305,00 €</div></div>
+<div><a href="/dp/B0E1111111"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B0E1111111">Sony WH-1000XM5 Silber Neu</a><div class="p">305,00 €</div><div>阿花的数码小店</div></div>
 <div><a href="/dp/B0F2222222"><img width="100" height="100" src="data:image/gif;base64,R0lGODlhAQABAAAAACw="></a><a href="/dp/B0F2222222">Sony WH-1000XM5 gebraucht</a><div class="p">180,00 €</div></div>
 </body></html>"#;
+
+const DETAIL_GOOD: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Sony WH-1000XM5</title>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Sony WH-1000XM5","aggregateRating":{"ratingValue":"4.7","reviewCount":"2311"},
+"review":[{"reviewBody":"降噪效果非常好，通勤地铁上很安静"},{"reviewBody":"音质清晰，佩戴舒适，续航长"},{"reviewBody":"官方旗舰店发货快，包装完好是正品"}]}</script></head>
+<body><h1>Sony WH-1000XM5</h1><div class="shop">店铺评分 描述 4.9 服务 4.8 物流 4.8 · 开店 6 年</div></body></html>"#;
+
+const DETAIL_BAD: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Sony WH-1000XM5 Silber</title></head><body><h1>Sony WH-1000XM5 Silber</h1>
+<div class="review-list"><div class="review-item">收到的是假货，做工很差</div><div class="review-item">怀疑不是正品，声音发闷</div><div class="review-item">客服态度差，不给退</div></div>
+<div>4,0 von 5 · 58 Bewertungen</div></body></html>"#;
 
 async fn read_request(sock: &mut tokio::net::TcpStream) -> (String, String) {
     let mut buf = Vec::new();
@@ -55,6 +64,22 @@ fn llm_reply(body: &str, custom_id: &str) -> String {
             else { json!({"i":c["i"],"score":95,"verdict":"exact","reasons":["型号一致"],"flags":[],"productKey":"sony wh-1000xm5"}) }
         }).collect();
         json!({"items": out}).to_string()
+    } else if sys.contains("商品风险审核员") {
+        let u: Value = serde_json::from_str(&user).unwrap_or(json!({}));
+        let out: Vec<Value> = u["candidates"].as_array().cloned().unwrap_or_default().iter().map(|c| {
+            let t = c["title"].as_str().unwrap_or("");
+            if t.contains("Schwarz") { json!({"i":c["i"],"adjust":-3,"factors":[],"summary":"旗舰店正品，价格正常，风险低"}) }
+            else { json!({"i":c["i"],"adjust":4,"factors":[{"kind":"shop","label":"小店销售大牌","weight":6}],"summary":"小店销售大牌商品，需确认渠道"}) }
+        }).collect();
+        json!({"items": out}).to_string()
+    } else if sys.contains("评论分析师") {
+        let u: Value = serde_json::from_str(&user).unwrap_or(json!({}));
+        let out: Vec<Value> = u["products"].as_array().cloned().unwrap_or_default().iter().map(|c| {
+            let t = c["title"].as_str().unwrap_or("");
+            if t.contains("Schwarz") { json!({"i":c["i"],"score":91,"pros":["降噪好","佩戴舒适"],"cons":[],"redFlags":[],"matchNote":"多条评论提到通勤降噪效果好","shopNote":"店铺评分高"}) }
+            else { json!({"i":c["i"],"score":38,"pros":[],"cons":["做工差"],"redFlags":["多条评论怀疑假货"],"matchNote":null,"shopNote":null}) }
+        }).collect();
+        json!({"items": out}).to_string()
     } else if sys.contains("购物顾问") {
         let u: Value = serde_json::from_str(&user).unwrap_or(json!({}));
         let id = u["results"][0]["id"].as_str().unwrap_or("").to_string();
@@ -80,6 +105,10 @@ async fn serve(custom_id: std::sync::Arc<std::sync::Mutex<String>>) -> u16 {
                     ("application/json", json!({"choices":[{"message":{"role":"assistant","content":content}}],"usage":{"prompt_tokens":10,"completion_tokens":5}}).to_string())
                 } else if path.starts_with("/s?") {
                     ("text/html; charset=utf-8", SHOP.to_string())
+                } else if path.starts_with("/dp/B09Y2MYL5C") {
+                    ("text/html; charset=utf-8", DETAIL_GOOD.to_string())
+                } else if path.starts_with("/dp/") {
+                    ("text/html; charset=utf-8", DETAIL_BAD.to_string())
                 } else {
                     ("text/plain", "nope".to_string())
                 };
@@ -127,6 +156,9 @@ fn full_pipeline_with_mock_ai() {
                 RunEventBody::Filter { fetched, kept, dropped, .. } => println!("#{} filter fetched={fetched} kept={kept} dropped={dropped:?}", ev.seq),
                 RunEventBody::Verify { checked, matched, hidden } => println!("#{} verify {checked} {matched} {hidden}", ev.seq),
                 RunEventBody::Summary { summary } => println!("#{} summary {}", ev.seq, summary.headline),
+                RunEventBody::PlatformPlan { chosen, skipped, reason } => println!("#{} platform_plan {chosen:?} skipped={} {reason}", ev.seq, skipped.len()),
+                RunEventBody::Funnel { stage, input, kept, note, .. } => println!("#{} funnel {stage} {input}→{kept} {note:?}", ev.seq),
+                RunEventBody::Results { items } => println!("#{} results {}", ev.seq, items.len()),
                 RunEventBody::Done { stats } => println!("#{} done ai_calls={} elapsed={}ms", ev.seq, stats.ai_calls, stats.elapsed_ms),
                 RunEventBody::Error { message } => println!("#{} ERROR {message}", ev.seq),
                 other => println!("#{} {:?}", ev.seq, std::mem::discriminant(other)),
@@ -136,6 +168,40 @@ fn full_pipeline_with_mock_ai() {
         for r in &outcome.results {
             println!("{:>2}. {:<40} {:?} {} → {:?} CNY? {} {:?} also={}", r.rank, r.title, r.price, r.currency, r.display_price, r.match_info.verdict, r.match_info.reasons, r.also_on.len());
         }
+        for r in &outcome.results {
+            println!("    tags={:?} shop={:?} risk={:?} review={:?} final={:?}", r.tags.iter().map(|t| &t.label).collect::<Vec<_>>(),
+                r.shop_info.as_ref().map(|s| (&s.label, s.credibility)), r.risk.as_ref().map(|x| (x.score, &x.level, &x.summary)),
+                r.review_insight.as_ref().map(|v| (v.score, v.rating, v.count, &v.red_flags, &v.unavailable_reason)), r.final_score);
+        }
+        // v26.03：阶段顺序、平台判定、漏斗
+        let mut stages: Vec<String> = vec![];
+        for ev in h.since(0) {
+            if let RunEventBody::Stage { stage, .. } = &ev.body {
+                if stages.last() != Some(stage) {
+                    stages.push(stage.clone());
+                }
+            }
+        }
+        assert_eq!(stages, ["plan", "platforms", "search", "screen", "risk", "shop", "reviews", "review_ai", "final", "summarize", "done"]);
+        let evs = h.since(0);
+        assert!(evs.iter().any(|e| matches!(&e.body, RunEventBody::PlatformPlan { chosen, .. } if chosen == &vec![cid.lock().unwrap().clone()])));
+        let funnels: Vec<String> = evs.iter().filter_map(|e| if let RunEventBody::Funnel { stage, .. } = &e.body { Some(stage.clone()) } else { None }).collect();
+        assert_eq!(funnels, ["search", "screen", "risk", "shop", "reviews", "review_ai", "final"]);
+        assert!(evs.iter().filter(|e| matches!(e.body, RunEventBody::Results { .. })).count() >= 6, "progressive results");
+        let best = outcome.results.iter().find(|r| r.title.contains("Schwarz")).unwrap();
+        assert_eq!(best.rank, 1);
+        assert_eq!(best.tags[0].label, "旗舰店");
+        assert_eq!(best.shop_info.as_ref().unwrap().kind, "flagship");
+        assert!(best.shop_info.as_ref().unwrap().scores.contains_key("服务"));
+        assert_eq!(best.risk.as_ref().unwrap().level, "low");
+        assert!(best.risk.as_ref().unwrap().ai_checked);
+        let rv = best.review_insight.as_ref().unwrap();
+        assert_eq!((rv.score, rv.rating, rv.count, rv.ai_checked), (Some(91), Some(4.7), Some(2311), true));
+        assert_eq!(rv.match_note.as_deref(), Some("多条评论提到通勤降噪效果好"));
+        let silver = outcome.results.iter().find(|r| r.title.contains("Silber")).unwrap();
+        assert!(!silver.review_insight.as_ref().unwrap().red_flags.is_empty());
+        assert!(silver.risk.as_ref().unwrap().score > best.risk.as_ref().unwrap().score + 20, "reviews and shop raise risk");
+        assert!(best.final_score.unwrap() > silver.final_score.unwrap());
         // 二手被过滤；配件被标记为不相关并排在最后；精确匹配排第一（价格升序）
         assert!(outcome.results.iter().all(|r| !r.title.contains("gebraucht")));
         assert_eq!(outcome.results[0].match_info.verdict, "exact");
@@ -146,6 +212,10 @@ fn full_pipeline_with_mock_ai() {
         assert_eq!(detail.summary.status, "done");
         assert_eq!(detail.results.len(), outcome.results.len());
         assert!(detail.ai_summary.is_some());
+        let replay = detail.results.iter().find(|r| r.title.contains("Schwarz")).unwrap();
+        assert_eq!((replay.final_score, replay.tags.first().map(|t| t.label.as_str())), (best.final_score, Some("旗舰店")));
+        assert_eq!(replay.review_insight.as_ref().and_then(|v| v.score), Some(91));
+        assert_eq!(replay.risk.as_ref().map(|r| r.level.as_str()), Some("low"));
         let seqs: Vec<u64> = h.since(0).iter().map(|e| e.seq).collect();
         assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "seq contiguous");
         st.browser.shutdown().await;

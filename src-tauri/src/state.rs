@@ -33,6 +33,23 @@ impl AppState {
         let settings = crate::settings::load(&db);
         let browser = Arc::new(Browser::new(data_dir.join("browser-profile")));
         browser.configure(settings.search.background, settings.search.concurrency);
+        // v26.03：浏览器每次启动后，从加密会话备份恢复丢失的登录 Cookie
+        {
+            let (db, dir) = (db.clone(), data_dir.clone());
+            browser.set_launch_hook(Arc::new(move |current| {
+                let all = crate::platforms::all(&db);
+                let (ids, params) = crate::browser::vault::plan_restore(&db, &dir, &all, current);
+                if !ids.is_empty() {
+                    log::info!("session vault: restoring {ids:?}");
+                    // 恢复的会话需要重新确认（下次预检主动验证）
+                    for id in ids.iter() {
+                        crate::browser::login::mark_unverified(&db, id);
+                    }
+                    crate::browser::vault::note_restored(&ids);
+                }
+                params
+            }));
+        }
         Ok(AppState {
             ai: Arc::new(AiClient::new(db.clone(), http.clone())),
             fx: Arc::new(Fx::new(&db)),

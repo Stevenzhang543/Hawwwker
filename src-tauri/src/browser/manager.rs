@@ -18,6 +18,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 pub const OFFSCREEN: (i64, i64) = (-32000, -32000);
+
+/// 浏览器启动后的钩子：输入当前全部 Cookie，返回需要写回的 Cookie（`Storage.setCookies` 参数）。
+/// v26.03 用于从加密会话备份恢复丢失的登录（见 vault.rs）。
+pub type LaunchHook = Arc<dyn Fn(&[Value]) -> Vec<Value> + Send + Sync>;
 const PERSIST_DAYS: f64 = 30.0;
 const T: Duration = Duration::from_secs(15);
 
@@ -41,6 +45,7 @@ pub struct Browser {
     executable: RwLock<Option<String>>,
     wiping: AtomicBool,
     transport: RwLock<&'static str>,
+    launch_hook: StdMutex<Option<LaunchHook>>,
 }
 
 /// 标签守卫：搜索被取消或超时导致 future 被丢弃时，仍然关闭标签（修复标签泄漏、窗口留在屏幕上）。
@@ -65,6 +70,25 @@ impl Drop for TabGuard {
             let b = self.browser.clone();
             let id = std::mem::take(&mut self.id);
             tauri::async_runtime::spawn(async move { b.close_target(&id).await });
+        }
+    }
+}
+
+/// new_tab 内部使用：标签已创建、尚未交给调用方时被丢弃 → 关闭标签。
+struct PendingTarget {
+    conn: Arc<Conn>,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for PendingTarget {
+    fn drop(&mut self) {
+        if self.armed {
+            let c = self.conn.clone();
+            let id = std::mem::take(&mut self.id);
+            tauri::async_runtime::spawn(async move {
+                let _ = c.send("Target.closeTarget", json!({"targetId": id}), Duration::from_secs(5)).await;
+            });
         }
     }
 }
@@ -183,6 +207,7 @@ impl Browser {
             executable: RwLock::new(None),
             wiping: AtomicBool::new(false),
             transport: RwLock::new("pipe"),
+            launch_hook: StdMutex::new(None),
         }
     }
 
@@ -197,6 +222,32 @@ impl Browser {
 
     pub fn profile_dir(&self) -> &Path {
         &self.profile
+    }
+
+    /// 应用数据目录（浏览器目录的上一级），会话备份密钥放在这里。
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        self.profile.parent().map(|p| p.to_path_buf())
+    }
+
+    /// 设置启动钩子（每次启动新浏览器进程后执行一次）。
+    pub fn set_launch_hook(&self, hook: LaunchHook) {
+        if let Ok(mut h) = self.launch_hook.lock() {
+            *h = Some(hook);
+        }
+    }
+
+    async fn after_launch(&self, conn: &Arc<Conn>) {
+        let hook = self.launch_hook.lock().ok().and_then(|h| h.clone());
+        let Some(hook) = hook else { return };
+        let Ok(r) = conn.send("Storage.getCookies", json!({}), T).await else { return };
+        let current = r.get("cookies").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+        let params = hook(&current);
+        if !params.is_empty() {
+            match conn.send("Storage.setCookies", json!({"cookies": params}), T).await {
+                Ok(_) => log::info!("restored {} cookies from session vault after launch", params.len()),
+                Err(e) => log::warn!("restore cookies after launch failed: {e}"),
+            }
+        }
     }
 
     /// 当前通信方式：pipe（管道，无端口）或 port（回退）。
@@ -279,10 +330,11 @@ impl Browser {
             }
         };
         match &res {
-            Ok(_) => {
+            Ok(conn) => {
                 if let Ok(mut f) = self.fail.lock() {
                     *f = None;
                 }
+                self.after_launch(conn).await;
             }
             Err(e) => {
                 if let Ok(mut f) = self.fail.lock() {
@@ -424,21 +476,19 @@ impl Browser {
         if throttle {
             self.pace(url, Duration::from_millis(3000)).await;
         }
-        let id = self.create_target(url).await?;
         let conn = self.ensure().await?;
-        let session = match conn.send("Target.attachToTarget", json!({"targetId": id, "flatten": true}), T).await {
-            Ok(r) => r.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-            Err(e) => {
-                self.close_target(&id).await;
-                return Err(e);
-            }
-        };
+        let r = conn.send("Target.createTarget", json!({"url": url}), T).await?;
+        let id = r.get("targetId").and_then(|x| x.as_str()).map(|s| s.to_string()).ok_or("无法创建标签页")?;
+        // 标签一创建就挂上守卫：接入 / 等待加载期间 future 被外层超时丢弃，也会关闭这个标签（修复标签泄漏）
+        let mut pending = PendingTarget { conn: conn.clone(), id: id.clone(), armed: true };
+        let r = conn.send("Target.attachToTarget", json!({"targetId": id, "flatten": true}), T).await?;
+        let session = r.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if session.is_empty() {
-            self.close_target(&id).await;
             return Err("无法接入标签页".into());
         }
         let tab = Tab { id, session, conn };
         tab.ready(Duration::from_secs(12)).await;
+        pending.armed = false;
         Ok(tab)
     }
 
@@ -580,6 +630,17 @@ impl Browser {
         Ok(fixed.len())
     }
 
+    /// 写入 Cookie（`Storage.setCookies` 参数格式）。
+    pub async fn set_cookies(&self, params: Vec<Value>) -> Result<usize, String> {
+        if params.is_empty() {
+            return Ok(0);
+        }
+        let n = params.len();
+        let conn = self.ensure().await?;
+        conn.send("Storage.setCookies", json!({"cookies": params}), T).await?;
+        Ok(n)
+    }
+
     /// 只删除这些域名下的 Cookie（逐条 Network.deleteCookies），其他平台的登录不受影响。
     pub async fn delete_site_cookies(&self, suffixes: &[String]) -> Result<usize, String> {
         let cookies = self.cookies().await?;
@@ -607,6 +668,8 @@ impl Browser {
         Ok(n)
     }
 
+    /// 正常关闭浏览器：先发 `Browser.close` 让浏览器把 Cookie 数据库写盘，最多等 5 秒再强制结束
+    /// （强制结束可能丢掉刚登录的会话——这是"明明登录了，重启后却搜不出来"的原因之一）。
     pub async fn shutdown(&self) {
         let mut inner = self.inner.lock().await;
         if let Some(conn) = inner.conn.take() {

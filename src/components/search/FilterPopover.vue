@@ -1,5 +1,5 @@
 <script setup lang="ts">
-/* 结果筛选浮层：平台、成色、到手价区间、包邮、好价。工具栏上只留一个按钮 + 已启用条件数 */
+/* 结果筛选浮层：平台、成色、到手价区间、包邮、好价、风险、店铺类型。工具栏上只留一个按钮 + 已启用条件数 */
 import { computed, onBeforeUnmount, ref } from "vue";
 import { usePlatformStore } from "@/stores/platforms";
 import Icon from "@/components/ui/Icon.vue";
@@ -7,18 +7,37 @@ import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 import GSegmented from "@/components/ui/GSegmented.vue";
 import { blankFilters, type ResultFilters } from "./filters";
 
-const props = defineProps<{ modelValue: ResultFilters; platforms: string[]; currency: string; counts: Record<string, number> }>();
+const props = defineProps<{
+  modelValue: ResultFilters;
+  platforms: string[];
+  currency: string;
+  counts: Record<string, number>;
+  /** v26.03 结果里出现的店铺类型及数量 */
+  shopKinds?: { kind: string; label: string; count: number }[];
+  /** 是否有风险信息（快速模式 / 旧记录没有时不显示风险筛选） */
+  hasRisk?: boolean;
+}>();
 const emit = defineEmits<{ "update:modelValue": [ResultFilters] }>();
 const store = usePlatformStore();
 const open = ref(false);
+/** 浮层最大高度：按按钮下方可用空间计算，超出时内部滚动 */
+const maxH = ref(560);
+function measure() {
+  const r = root.value?.getBoundingClientRect();
+  if (r) maxH.value = Math.max(280, Math.min(600, window.innerHeight - r.bottom - 20));
+}
 const root = ref<HTMLElement | null>(null);
 
 const active = computed(() => {
   const f = props.modelValue;
-  return [f.platform !== "all", f.cond !== "any", !!f.min || !!f.max, f.freeShip, f.goodDeal].filter(Boolean).length;
+  return [f.platform !== "all", f.cond !== "any", !!f.min || !!f.max, f.freeShip, f.goodDeal, f.risk !== "any", f.shops.length > 0].filter(Boolean).length;
 });
 function set<K extends keyof ResultFilters>(k: K, v: ResultFilters[K]) {
   emit("update:modelValue", { ...props.modelValue, [k]: v });
+}
+function toggleShop(kind: string) {
+  const cur = props.modelValue.shops;
+  set("shops", cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind]);
 }
 function reset() {
   emit("update:modelValue", blankFilters());
@@ -30,13 +49,35 @@ function close() {
   open.value = false;
   document.removeEventListener("pointerdown", onDoc);
 }
+/** 最近的可滚动祖先（页面内容滚动容器） */
+function scrollParent(el: HTMLElement | null): HTMLElement | null {
+  for (let e = el?.parentElement ?? null; e; e = e.parentElement) {
+    const oy = getComputedStyle(e).overflowY;
+    if ((oy === "auto" || oy === "scroll") && e.scrollHeight > e.clientHeight) return e;
+  }
+  return null;
+}
 function toggle() {
   if (open.value) return close();
+  // 下方空间不够时先把页面往上滚（工具栏是吸顶的），保证浮层完整可见
+  const rect = root.value?.getBoundingClientRect();
+  const need = 470;
+  if (rect) {
+    const space = window.innerHeight - rect.bottom - 16;
+    if (space < need) scrollParent(root.value)?.scrollBy({ top: need - space, behavior: "smooth" });
+  }
   open.value = true;
+  measure();
+  setTimeout(measure, 420);
   setTimeout(() => document.addEventListener("pointerdown", onDoc), 0);
 }
 onBeforeUnmount(() => document.removeEventListener("pointerdown", onDoc));
 
+const riskOpts = [
+  { value: "any" as const, label: "不限" },
+  { value: "no_high" as const, label: "不看高风险" },
+  { value: "low" as const, label: "只看低风险" },
+];
 const condOpts = [
   { value: "any" as const, label: "不限" },
   { value: "new" as const, label: "全新" },
@@ -50,7 +91,7 @@ const condOpts = [
       <Icon name="filter" />筛选<span v-if="active" class="cnt">{{ active }}</span>
     </button>
     <Transition name="pop">
-      <div v-if="open" class="fp-pop glass-3" @keydown.esc="close">
+      <div v-if="open" class="fp-pop glass-3" :style="{ maxHeight: maxH + 'px' }" @keydown.esc="close">
         <div class="fp-head">
           <b>筛选结果</b>
           <span class="spacer"></span>
@@ -79,6 +120,20 @@ const condOpts = [
             <span class="faint">–</span>
             <input :value="modelValue.max" class="input sm" type="number" min="0" placeholder="最高" @input="set('max', ($event.target as HTMLInputElement).value)" />
             <span class="faint tiny">{{ currency }}</span>
+          </div>
+        </div>
+
+        <div v-if="hasRisk" class="fp-sec">
+          <span class="fp-l">风险</span>
+          <GSegmented :model-value="modelValue.risk" :options="riskOpts" small @update:model-value="(v) => set('risk', v)" />
+        </div>
+
+        <div v-if="shopKinds?.length" class="fp-sec">
+          <span class="fp-l">店铺类型<span class="faint">（可多选）</span></span>
+          <div class="fp-plats">
+            <button v-for="k in shopKinds" :key="k.kind" class="fp-p" :class="{ on: modelValue.shops.includes(k.kind) }" @click="toggleShop(k.kind)">
+              {{ k.label }}<span class="faint tiny">{{ k.count }}</span>
+            </button>
           </div>
         </div>
 
@@ -124,6 +179,8 @@ const condOpts = [
   display: flex;
   flex-direction: column;
   gap: 12px;
+  overflow-y: auto;
+  transition: max-height 240ms var(--ease-out);
 }
 .fp-head {
   display: flex;

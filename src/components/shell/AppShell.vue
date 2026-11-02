@@ -3,6 +3,7 @@ import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import Sidebar from "./Sidebar.vue";
 import TopBar from "./TopBar.vue";
+import LoginGate from "@/components/login/LoginGate.vue";
 import { useScrollBlur } from "@/composables/motion";
 import { useSearchStore } from "@/stores/search";
 import { useUiStore } from "@/stores/ui";
@@ -78,6 +79,8 @@ function goRun() {
         </router-view>
       </div>
     </main>
+    <!-- v26.03 登录门槛：搜索前所选平台需要登录时弹出 -->
+    <LoginGate />
   </div>
 </template>
 

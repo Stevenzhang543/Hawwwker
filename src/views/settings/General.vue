@@ -39,6 +39,16 @@ const effectOpts: { value: WindowEffect; label: string }[] = [
   { value: "acrylic", label: "Acrylic 亚克力" },
   { value: "none", label: "纯色" },
 ];
+const depthOpts = [
+  { value: "quick" as const, label: "快速" },
+  { value: "standard" as const, label: "标准" },
+  { value: "deep" as const, label: "深入" },
+];
+const DEPTH_DESC: Record<SearchPrefs["depth"], string> = {
+  quick: "理解需求 → 平台判定 → 搜索 → 粗筛 → 风险 → 店铺 → 细筛。不打开商品页读评论，最快，适合先看行情。",
+  standard: "在快速的基础上，为排名靠前的商品打开商品页读取商品评论与店铺评价，再由 AI 分析是否符合你的需求（推荐）。",
+  deep: "读取更多商品（至少 12 件）的评论与店铺评价，适合贵重、易买到假货或第一次买的品类；耗时明显更长。",
+};
 const regionOpts = [
   { value: "all" as const, label: "全部" },
   { value: "cn" as const, label: "国内版" },
@@ -130,6 +140,34 @@ const regionOpts = [
     </section>
 
     <section class="glass card">
+      <div class="card-head"><h3>检索深度与风险</h3><span class="faint tiny">理解需求 → 平台判定 → 搜索 → 粗筛 → 风险 → 店铺 → 评论检索 → 评论分析 → 细筛</span></div>
+      <div class="set">
+        <div class="set-l">
+          <b>检索深度</b>
+          <small>{{ DEPTH_DESC[s.search.depth] }}</small>
+        </div>
+        <GSegmented :model-value="s.search.depth" :options="depthOpts" @update:model-value="(v) => sp('depth', v)" />
+      </div>
+      <div class="set" :class="{ dim: s.search.depth === 'quick' }">
+        <div class="set-l"><b>读取评论的商品数</b><small>标准模式按此数量读取排名靠前商品的评论；深入模式至少 12 件。快速模式不读评论</small></div>
+        <input
+          class="input sm"
+          type="number"
+          min="1"
+          max="20"
+          style="width: 100px"
+          :disabled="s.search.depth === 'quick'"
+          :value="s.search.reviewTop"
+          @change="sp('reviewTop', Math.min(20, Math.max(1, Number(($event.target as HTMLInputElement).value) || 6)))"
+        />
+      </div>
+      <div class="set">
+        <div class="set-l"><b>自动折叠高风险商品</b><small>疑似假货、价格异常、店铺可信度很低的商品放进「可能不相关 / 高风险」，并写明原因；关闭后照常显示，只加风险标记</small></div>
+        <GSwitch :model-value="s.search.hideHighRisk" @update:model-value="(v) => sp('hideHighRisk', v)" />
+      </div>
+    </section>
+
+    <section class="glass card">
       <div class="card-head"><h3>快捷键</h3></div>
       <div class="keys">
         <span><kbd>Ctrl K</kbd> 命令面板</span><span><kbd>Ctrl J</kbd> Copilot</span><span><kbd>Enter</kbd> 运行指令</span>
@@ -150,6 +188,9 @@ const regionOpts = [
 }
 .card-head + .set {
   border-top: none;
+}
+.set.dim .set-l {
+  opacity: 0.55;
 }
 .set-l {
   flex: 1;

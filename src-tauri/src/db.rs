@@ -94,6 +94,20 @@ const MIGRATIONS: &[&str] = &[
         platform_id TEXT NOT NULL, external_id TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY(platform_id, external_id, scope));
     "#,
+    // v3（v26.03）：登录会话备份与主动验证；店铺 / 风险 / 评论 / 标签 / 综合分
+    r#"
+    ALTER TABLE login_meta ADD COLUMN checked_at TEXT;
+    ALTER TABLE login_meta ADD COLUMN probe_ok INTEGER;
+    CREATE TABLE IF NOT EXISTS login_vault(
+        platform_id TEXT PRIMARY KEY, blob BLOB NOT NULL, cookie_count INTEGER NOT NULL DEFAULT 0, saved_at TEXT NOT NULL);
+    ALTER TABLE listings ADD COLUMN shop_json TEXT;
+    ALTER TABLE listings ADD COLUMN badges TEXT;
+    ALTER TABLE listings ADD COLUMN review_json TEXT;
+    ALTER TABLE listings ADD COLUMN review_at TEXT;
+    ALTER TABLE run_results ADD COLUMN risk_json TEXT;
+    ALTER TABLE run_results ADD COLUMN tags_json TEXT;
+    ALTER TABLE run_results ADD COLUMN final_score INTEGER;
+    "#,
 ];
 
 impl Db {

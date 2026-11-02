@@ -1,7 +1,7 @@
 {
   "name": "hawwwker",
   "private": true,
-  "version": "26.2.0",
+  "version": "26.3.0",
   "description": "Hawwwker 货客 — AI 多平台购物搜索、比价与盯价",
   "type": "module",
   "scripts": {

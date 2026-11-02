@@ -58,7 +58,7 @@ export function makePlatforms(): PlatformInfo[] {
 }
 
 const LOGIN_INIT: Record<string, LoginStatus> = {
-  xiaohongshu: "expired", douyin: "logged_out", pinduoduo: "logged_in", taobao: "logged_in", jd: "logged_in",
+  xiaohongshu: "expired", douyin: "logged_out", pinduoduo: "logged_in", taobao: "logged_out", jd: "logged_in",
   alibaba1688: "logged_in", xianyu: "logged_in", weibo: "logged_out", rednote: "logged_out", tiktok: "logged_out",
   amazon_com: "logged_out", amazon_de: "logged_in", amazon_co_uk: "unknown", amazon_co_jp: "unknown", amazon_fr: "unknown",
 };
@@ -67,7 +67,6 @@ export function makeLogins(platforms: PlatformInfo[]): LoginState[] {
   const now = Date.now();
   return platforms.map((p) => {
     const status: LoginStatus = LOGIN_INIT[p.id] ?? (p.login === "optional" ? "not_needed" : "unknown");
-    const sharedWith = platforms.filter((o) => o.accountGroup === p.accountGroup && o.id !== p.id).map((o) => o.id);
     return {
       platformId: p.id,
       status,
@@ -76,7 +75,8 @@ export function makeLogins(platforms: PlatformInfo[]): LoginState[] {
       lastWallAt: status === "expired" ? new Date(now - 2 * 3600_000).toISOString() : null,
       cookieExpires: status === "logged_in" ? new Date(now + 26 * 86400_000).toISOString() : null,
       message: status === "expired" ? "最近一次搜索遇到登录页，需要重新登录" : null,
-      sharedWith,
+      checkedAt: status === "logged_in" ? new Date(now - (2 + (p.id.length % 5)) * 3600_000).toISOString() : null,
+      vaulted: status === "logged_in" && p.login !== "optional",
     };
   });
 }
@@ -95,19 +95,19 @@ export function fxConvert(amount: number, from: string, to: string): number {
 }
 
 export const PRESETS: AiPreset[] = [
-  { id: "deepseek", name: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com/v1", models: ["deepseek-chat", "deepseek-reasoner"], fastModel: "deepseek-chat", keyUrl: "https://platform.deepseek.com/api_keys", note: "中文能力强、价格低，推荐", region: "cn" },
-  { id: "qwen", name: "通义千问 · 百炼", protocol: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen-plus", "qwen-max", "qwen-turbo"], fastModel: "qwen-turbo", keyUrl: "https://bailian.console.aliyun.com/", note: "阿里云百炼 OpenAI 兼容模式", region: "cn" },
-  { id: "kimi", name: "Kimi · 月之暗面", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", models: ["moonshot-v1-32k", "moonshot-v1-8k"], keyUrl: "https://platform.moonshot.cn/console/api-keys", note: "长上下文", region: "cn" },
-  { id: "zhipu", name: "智谱 GLM", protocol: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-4-plus", "glm-4-flash"], fastModel: "glm-4-flash", keyUrl: "https://open.bigmodel.cn/usercenter/apikeys", note: "flash 模型适合做快速校验", region: "cn" },
-  { id: "openai", name: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-4.1", "gpt-4.1-mini"], fastModel: "gpt-4.1-mini", keyUrl: "https://platform.openai.com/api-keys", note: "", region: "intl" },
-  { id: "anthropic", name: "Anthropic Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com", models: ["claude-sonnet-4-5", "claude-haiku-4-5"], fastModel: "claude-haiku-4-5", keyUrl: "https://console.anthropic.com/settings/keys", note: "原生 Messages 协议", region: "intl" },
-  { id: "gemini", name: "Google Gemini", protocol: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", models: ["gemini-2.5-pro", "gemini-2.5-flash"], fastModel: "gemini-2.5-flash", keyUrl: "https://aistudio.google.com/apikey", note: "OpenAI 兼容端点", region: "intl" },
-  { id: "ollama", name: "Ollama 本地", protocol: "openai", baseUrl: "http://localhost:11434/v1", models: ["qwen2.5:14b", "llama3.1:8b"], keyUrl: "https://ollama.com/", note: "本机运行，无需 Key（可填任意值）", region: "local" },
-  { id: "custom", name: "自定义", protocol: "openai", baseUrl: "", models: [], keyUrl: "", note: "任何 OpenAI 兼容服务", region: "local" },
+  { id: "deepseek", name: "DeepSeek", protocol: "openai", baseUrl: "https://api.deepseek.com", models: ["deepseek-flash", "deepseek-v4-pro"], fastModel: "deepseek-flash", keyUrl: "https://platform.deepseek.com/api_keys", note: "deepseek-flash 始终指向最新 Flash；结构化任务自动关闭思考模式；推荐作为默认", region: "cn", retired: ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"] },
+  { id: "qwen", name: "通义千问（阿里云百炼）", protocol: "openai", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", models: ["qwen3.8-max", "qwen3.7-plus", "qwen3.8-flash"], fastModel: "qwen3.8-flash", keyUrl: "https://bailian.console.aliyun.com/", note: "OpenAI 兼容模式；qwen-plus / qwen-max 为旧别名", region: "cn", retired: ["qwen-turbo", "qwen-plus", "qwen-max", "qwen-flash"] },
+  { id: "kimi", name: "Kimi（月之暗面）", protocol: "openai", baseUrl: "https://api.moonshot.cn/v1", models: ["kimi-k3.1-pro", "kimi-k3", "kimi-k3.1-pro-highspeed"], fastModel: "kimi-k3", keyUrl: "https://platform.moonshot.cn/console/api-keys", note: "国际账号用 https://api.moonshot.ai/v1；K2 系列年底下线", region: "cn", retired: ["kimi-latest", "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k", "kimi-k2-turbo-preview", "kimi-k2.5", "kimi-k2.6"] },
+  { id: "zhipu", name: "智谱 GLM", protocol: "openai", baseUrl: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-5.3", "glm-5.2", "glm-4.7-flash"], fastModel: "glm-4.7-flash", keyUrl: "https://open.bigmodel.cn/usercenter/apikeys", note: "glm-4.7-flash 免费，可作快速模型", region: "cn", retired: ["glm-4-flash", "glm-4-plus", "glm-4-air"] },
+  { id: "openai", name: "OpenAI", protocol: "openai", baseUrl: "https://api.openai.com/v1", models: ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-terra"], fastModel: "gpt-6-luna", keyUrl: "https://platform.openai.com/api-keys", note: "需要可访问 OpenAI 的网络；gpt-5 系列 2026-12-11 停用", region: "intl", retired: ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini"] },
+  { id: "anthropic", name: "Anthropic Claude", protocol: "anthropic", baseUrl: "https://api.anthropic.com", models: ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"], fastModel: "claude-haiku-5-5", keyUrl: "https://console.anthropic.com/settings/keys", note: "原生 Messages 协议；模型 ID 为固定版本，新模型发布后需手动更换", region: "intl", retired: ["claude-sonnet-4-5", "claude-haiku-4-5"] },
+  { id: "gemini", name: "Google Gemini", protocol: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", models: ["gemini-3.8-flash", "gemini-4-argon", "gemini-3.5-flash-lite"], fastModel: "gemini-3.5-flash-lite", keyUrl: "https://aistudio.google.com/apikey", note: "OpenAI 兼容端点；2.5 系列仅老账号可用", region: "intl", retired: ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-pro-preview", "gemini-3-flash-preview"] },
+  { id: "ollama", name: "Ollama（本机）", protocol: "openai", baseUrl: "http://localhost:11434/v1", models: ["qwen3.5:9b", "qwen3.8:27b", "qwen3.5:4b"], keyUrl: "https://ollama.com/library", note: "本机运行，无需 API Key；小模型的校验准确度较低", region: "local", retired: ["qwen2.5:14b", "qwen2.5:7b", "llama3.1:8b"] },
+  { id: "custom", name: "自定义（OpenAI 兼容）", protocol: "openai", baseUrl: "", models: [], keyUrl: "", note: "任何兼容 /chat/completions 的服务", region: "intl", retired: [] },
 ];
 
 export const SKILLS: CopilotSkill[] = [
-  { id: "gift", name: "礼物构思", icon: "gift", description: "按对象、预算、场合给出礼物方向，并一键去搜", starter: "帮我给喜欢露营的爸爸挑 500 元以内的生日礼物", roles: ["consumer"] },
+  { id: "gift", name: "礼物构思", icon: "gift", description: "懂人情世故：按关系、场合、预算给出稳妥的礼物方向，避开雷区", starter: "给我选 500 元内送爱喝茶的朋友的礼物", roles: ["consumer"] },
   { id: "compare", name: "比价顾问", icon: "scale", description: "对比同款在不同平台/站点的到手价与风险", starter: "Sony WH-1000XM5 在亚马逊德国和京东哪个更划算？", roles: ["consumer", "merchant"] },
   { id: "timing", name: "入手时机", icon: "timer", description: "结合价格走势判断现在买还是再等等", starter: "我追踪的 Switch 2 现在值得入手吗？", roles: ["consumer"] },
   { id: "industry", name: "行业判断", icon: "compass", description: "品类趋势、价格带、竞争格局的快速判断", starter: "蓝牙耳机品类在欧洲的价格带和主要玩家是什么样？", roles: ["merchant", "analyst"] },

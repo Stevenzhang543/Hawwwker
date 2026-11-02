@@ -6,27 +6,31 @@ pub mod extract;
 pub mod launch;
 pub mod login;
 pub mod manager;
+pub mod vault;
 
 use crate::db::Db;
 use crate::platforms;
 use manager::Browser;
 use std::time::Duration;
 
-/// 保活：低频访问已登录平台首页（不搜索、不采集），并把会话 Cookie 持久化。
-pub async fn keepalive(db: &Db, browser: &Browser) -> Vec<String> {
+/// 保活：低频访问已登录平台首页（不搜索、不采集），把会话 Cookie 持久化并刷新会话备份。
+pub async fn keepalive(db: &Db, browser: &Browser, logins: &login::LoginManager) -> Vec<String> {
     if !browser.profile_dir().exists() {
         return vec![];
     }
     let all = platforms::all(db);
-    let states = login::LoginManager::new().refresh(db, browser, true).await;
+    // 用全局登录管理器：正在登录的平台不刷新、不保活、不备份
+    let states = logins.refresh(db, browser, true).await;
     let mut touched = vec![];
-    for st in states.iter().filter(|s| s.status == "logged_in") {
+    for st in states.iter().filter(|s| s.status == "logged_in" && s.flow == "idle") {
         let Some(p) = all.iter().find(|p| p.id == st.platform_id && p.enabled && !p.keepalive.is_empty()) else { continue };
         let _slot = browser.slot().await;
         if let Ok(tab) = browser.new_tab(&p.keepalive, true).await {
             tokio::time::sleep(Duration::from_millis(4000 + (chrono::Utc::now().timestamp_subsec_millis() as u64 % 3000))).await;
             browser.close_tab(tab).await;
             let _ = browser.persist_session_cookies(&p.cookie_domains).await;
+            // v26.03：保活后刷新加密会话备份
+            vault::snapshot(db, browser, &[p]).await;
             touched.push(p.id.clone());
         }
     }

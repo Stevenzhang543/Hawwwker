@@ -6,8 +6,7 @@ import { useCopilotStore } from "@/stores/copilot";
 import { useSearchStore } from "@/stores/search";
 import { useWatchStore } from "@/stores/watch";
 import { useAppStore } from "@/stores/app";
-import { openExternal, toAppError } from "@/api";
-import type { CopilotAction } from "@/api/types";
+import type { CopilotAction, CopilotMessage } from "@/api/types";
 import { findNav } from "@/nav";
 import type { CopilotContextChip } from "@/stores/copilot";
 import { handleMdClick, renderMarkdown, stripActions } from "@/utils/markdown";
@@ -56,20 +55,15 @@ const moreActive = computed(() => moreSkills.value.find((s) => s.id === cp.skill
 
 /** 可附加的页面上下文：只有附加后 Copilot 才能看到（不会自动上传页面内容） */
 const here = computed(() => findNav(route.path));
+/** 自动附带：所在页面 + 当前搜索（结果页上附前 8 条精简结果） */
+const autoSeen = computed(() => {
+  const parts = [here.value ? here.value.item.label : "当前页面"];
+  const run = search.current;
+  if (run) parts.push(`当前搜索「${run.instruction.length > 10 ? run.instruction.slice(0, 10) + "…" : run.instruction}」`);
+  return parts.join(" · ");
+});
 const suggestion = computed<CopilotContextChip | null>(() => {
   if (cp.context) return null;
-  const run = search.current;
-  if (route.path.startsWith("/discover/search") && run && run.results.length) {
-    const top = run.results.filter((r) => r.match.verdict !== "mismatch").slice(0, 12);
-    return {
-      label: `当前搜索：${run.instruction.length > 14 ? run.instruction.slice(0, 14) + "…" : run.instruction}`,
-      data: {
-        kind: "search",
-        instruction: run.instruction,
-        results: top.map((r) => ({ id: r.id, title: r.title, platformId: r.platformId, price: r.price, currency: r.currency, landedPrice: r.landedPrice ?? null, deal: r.deal?.label ?? null, verdict: r.match.verdict, url: r.url })),
-      },
-    };
-  }
   if (route.path.startsWith("/track/watchlist") && watchStore.items.length) {
     return {
       label: `我的追踪清单（${watchStore.items.length} 件）`,
@@ -108,25 +102,38 @@ function pickSkill(id: string) {
   inputEl.value?.focus();
 }
 
-async function act(a: CopilotAction) {
+function execOf(m: CopilotMessage, i: number) {
+  return cp.exec[m.id]?.[i] ?? null;
+}
+/** 自动执行的动作 / 已执行过的动作显示状态行，其余显示为按钮 */
+function autoActs(m: CopilotMessage) {
+  return m.actions.map((a, i) => ({ a, i, e: execOf(m, i) })).filter((x) => x.a.auto || x.e);
+}
+function buttonActs(m: CopilotMessage) {
+  return m.actions.map((a, i) => ({ a, i, e: execOf(m, i) })).filter((x) => !x.a.auto && !x.e);
+}
+const run = computed(() => cp.activeRun);
+const runDone = computed(() => (run.value ? Object.values(run.value.platforms).filter((p) => ["done", "error", "skipped", "login_required"].includes(p.state)).length : 0));
+const runTotal = computed(() => (run.value ? Object.keys(run.value.platforms).length : 0));
+const runCount = computed(() => {
+  const r = run.value;
+  if (!r) return 0;
+  return r.results.length || Object.values(r.partial ?? {}).reduce((n, l) => n + l.length, 0);
+});
+async function cancelRun() {
+  if (!run.value) return;
   try {
-    if (a.type === "search") {
-      await router.push("/discover/search");
-      await search.start(a.instruction);
-      ui.toast("已按 Copilot 建议开始搜索", "ai", 2200, a.instruction);
-    } else if (a.type === "watch") {
-      await watchStore.add({ listingId: a.listingId, targetPrice: a.targetPrice ?? null });
-      ui.toast("已加入价格追踪", "success");
-    } else if (a.type === "open") {
-      await openExternal(a.url);
-    } else if (a.type === "navigate") {
-      await router.push(a.route);
-    }
+    await search.cancel(run.value.runId);
   } catch (e) {
-    ui.toast(toAppError(e).message, "error", 4000);
+    ui.toast(String((e as { message?: string }).message ?? e), "error");
   }
 }
-const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch: "tag", open: "external", navigate: "arrow" };
+async function viewRun() {
+  if (!run.value) return;
+  search.currentId = run.value.runId;
+  if (!route.path.startsWith("/discover/search")) await router.push("/discover/search");
+}
+const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch: "tag", open: "external", navigate: "arrow", monitor: "clock", login: "login", setting: "gear", results: "list" };
 
 async function reset() {
   if (await ui.confirm("清空对话？", "将删除本会话的全部消息。", "清空")) await cp.reset();
@@ -140,7 +147,7 @@ async function reset() {
         <span class="cp-logo"><Icon name="bot" :size="18" /></span>
         <div class="cp-title">
           <b>Copilot</b>
-          <small>{{ app.ai.model || "未连接模型" }} · 回答中的动作需要你点击才会执行</small>
+          <small>{{ app.ai.model || "未连接模型" }} · 说"用 app 搜索…"我会直接操作，其余动作点按钮执行</small>
         </div>
         <button class="icon-btn" title="清空对话" @click="reset"><Icon name="refresh" :size="16" /></button>
         <button class="icon-btn" title="关闭（Esc）" @click="ui.copilotOpen = false"><Icon name="x" /></button>
@@ -181,11 +188,23 @@ async function reset() {
 
         <div v-for="m in cp.messages" :key="m.id" class="msg" :class="m.role">
           <div v-if="m.role === 'user'" class="bubble selectable">{{ m.content }}</div>
+          <div v-else-if="m.role === 'event'" class="event"><Icon name="zap" :size="12" />{{ m.content }}</div>
           <template v-else>
             <div class="md selectable" v-html="renderMarkdown(stripActions(m.content))"></div>
-            <div v-if="m.actions.length" class="acts">
-              <button v-for="(a, i) in m.actions" :key="i" v-ripple class="btn sm" @click="act(a)">
-                <Icon :name="actIcon[a.type]" :size="14" />{{ a.label }}
+            <div v-if="autoActs(m).length" class="execs">
+              <div v-for="x in autoActs(m)" :key="x.i" class="exec" :class="x.e?.status ?? 'pending'">
+                <span class="e-ico">
+                  <span v-if="!x.e || x.e.status === 'running'" class="spin"></span>
+                  <Icon v-else-if="x.e.status === 'done'" name="check" :size="13" :stroke="2.6" />
+                  <Icon v-else name="warn" :size="13" />
+                </span>
+                <span class="e-text"><b>{{ x.a.auto ? "自动执行" : "已执行" }}</b> · <Icon :name="actIcon[x.a.type]" :size="12" />{{ x.a.label }}<small v-if="x.e"> — {{ x.e.note }}</small><small v-else> — 等待执行</small></span>
+                <button v-if="x.e?.status === 'failed'" class="retry" @click="cp.clickAction(m, x.i)">重试</button>
+              </div>
+            </div>
+            <div v-if="buttonActs(m).length" class="acts">
+              <button v-for="x in buttonActs(m)" :key="x.i" v-ripple class="btn sm" @click="cp.clickAction(m, x.i)">
+                <Icon :name="actIcon[x.a.type]" :size="14" />{{ x.a.label }}
               </button>
             </div>
           </template>
@@ -201,13 +220,29 @@ async function reset() {
         <p v-if="cp.error" class="banner" style="margin-top: 8px"><Icon name="warn" />{{ cp.error }}</p>
       </div>
 
+      <Transition name="blur">
+        <div v-if="run" class="runcard">
+          <div class="rc-head">
+            <span class="rc-ico" :class="run.status"><span v-if="run.status === 'running'" class="spin"></span><Icon v-else :name="run.status === 'done' ? 'check' : 'warn'" :size="14" /></span>
+            <div class="rc-text">
+              <b>{{ run.status === "running" ? run.stageLabel || "正在搜索…" : run.status === "done" ? "搜索完成，正在请 Copilot 点评" : "搜索已结束" }}</b>
+              <small>{{ run.instruction }}</small>
+            </div>
+            <button v-if="run.status === 'running'" class="btn ghost sm" @click="cancelRun"><Icon name="stop" :size="13" />取消</button>
+            <button class="btn sm" @click="viewRun"><Icon name="arrow" :size="13" />查看</button>
+          </div>
+          <div class="rc-bar"><i :style="{ width: Math.round((run.progress || 0) * 100) + '%' }"></i></div>
+          <small class="rc-meta">平台 {{ runDone }}/{{ runTotal }} · 已出 {{ runCount }} 条{{ run.status === "running" && !run.results.length && runCount ? "（初步）" : "" }}</small>
+        </div>
+      </Transition>
+
       <footer class="composer">
         <div class="ctx">
           <span class="ctx-label" :title="`你在：${here ? here.group.label + ' · ' + here.item.label : '—'}。Copilot 只看到你的输入、角色和下面附加的上下文。`"><Icon name="eye" :size="12" />Copilot 看到</span>
           <span v-if="activeSkill" class="chip purple"><Icon :name="activeSkill.icon" />{{ activeSkill.name }}<button class="x" title="取消技能" @click="cp.skill = null"><Icon name="x" :size="11" /></button></span>
           <span v-if="cp.context" class="chip blue"><Icon name="tag" />{{ cp.context.label }}<button class="x" title="移除上下文" @click="cp.setContext(null)"><Icon name="x" :size="11" /></button></span>
           <button v-else-if="suggestion" class="chip outline click" title="附加后 Copilot 才能看到这些内容" @click="cp.setContext(suggestion)"><Icon name="plus" />附上{{ suggestion.label }}</button>
-          <span v-if="!cp.context && !activeSkill && !suggestion" class="faint tiny">你的输入与角色（{{ { consumer: "消费者", merchant: "商户", analyst: "平台分析" }[app.role] }}）</span>
+          <span class="faint tiny" :title="'自动附带：你所在的页面与当前搜索的概要（结果页上附前 8 条精简结果），用于理解“这些结果”“当前页面”。'">{{ autoSeen }}</span>
         </div>
         <div class="input-row">
           <textarea ref="inputEl" v-model="text" rows="2" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）" @keydown="onKey"></textarea>
@@ -469,6 +504,160 @@ async function reset() {
 }
 .md :deep(strong) {
   font-weight: 680;
+}
+.event {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 92%;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-2);
+  background: var(--info-bg);
+  border: 1px solid var(--line);
+}
+.msg.event {
+  align-items: center;
+}
+.execs {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.exec {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 12px;
+  font-size: 12.5px;
+  background: var(--glass-1);
+  border: 1px solid var(--line);
+}
+.exec.done {
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+}
+.exec.failed {
+  border-color: color-mix(in srgb, var(--err) 40%, transparent);
+  background: var(--err-bg);
+}
+.e-ico {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--brand);
+}
+.exec.done .e-ico {
+  background: var(--ok);
+}
+.exec.failed .e-ico {
+  background: var(--err);
+}
+.e-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+}
+.retry {
+  border: none;
+  background: none;
+  color: var(--brand-ink);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.e-text small {
+  color: var(--text-3);
+}
+.e-text :deep(svg) {
+  vertical-align: -2px;
+  margin: 0 2px;
+}
+.spin {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-top-color: #fff;
+  animation: cp-spin 0.8s linear infinite;
+}
+@keyframes cp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.runcard {
+  margin: 0 12px 8px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--glass-2);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-1);
+}
+.rc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.rc-ico {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: #fff;
+  background: var(--brand-grad);
+}
+.rc-ico.done {
+  background: var(--ok);
+}
+.rc-ico.error,
+.rc-ico.cancelled,
+.rc-ico.interrupted {
+  background: var(--warn);
+}
+.rc-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.rc-text b {
+  font-size: 12.5px;
+}
+.rc-text small {
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rc-bar {
+  height: 4px;
+  margin: 8px 0 5px;
+  border-radius: 4px;
+  background: var(--line);
+  overflow: hidden;
+}
+.rc-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--brand-grad);
+  transition: width var(--t-slow) var(--ease-out);
+}
+.rc-meta {
+  font-size: 11px;
+  color: var(--text-3);
 }
 .acts {
   display: flex;

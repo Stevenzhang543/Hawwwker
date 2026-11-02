@@ -7,6 +7,7 @@ import type {
   Monitor, MonitorCreateInput, MonitorPatch, Notice, PlatformInfo, PlatformPatch, PricePoint, RunDetail, RunEvent,
   RunSummary, SearchPlan, TrendSeries, WatchAddInput, WatchItem, WatchPatch,
   LinkInfo, LocalAi, Recommendation, SelfTestResult,
+  LoginCheck, ModelList,
 } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -56,6 +57,8 @@ export const api = {
   aiPresets: () => call<AiPreset[]>("ai_presets"),
   aiUsage: () => call<AiUsage>("ai_usage"),
   aiDetectLocal: () => call<LocalAi>("ai_detect_local"),
+  /** v26.03：列出服务商当前可用的模型（不传 input 时用已保存的配置） */
+  aiListModels: (input?: AiConfigInput) => call<ModelList>("ai_list_models", { input: input ?? null }),
 
   /* platforms & login */
   platformsList: () => call<PlatformInfo[]>("platforms_list"),
@@ -69,6 +72,10 @@ export const api = {
   loginConfirm: (platformId: string) => call<LoginState>("login_confirm", { platformId }),
   loginCancel: (platformId: string) => call<LoginState>("login_cancel", { platformId }),
   logout: (platformId: string) => call<LoginState>("logout", { platformId }),
+  /** v26.03：搜索前登录预检；verify = true 会对较久未验证的平台做主动验证 */
+  loginPreflight: (platformIds: string[], verify = true) => call<LoginCheck[]>("login_preflight", { platformIds, verify }),
+  /** v26.03：登录体检（主动验证所有已启用、需要登录的平台） */
+  loginCheckAll: () => call<LoginState[]>("login_check_all"),
   browserInfo: () => call<BrowserInfo>("browser_info"),
   browserShow: () => call<void>("browser_show"),
   browserWipe: () => call<void>("browser_wipe"),

@@ -5,6 +5,14 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
+/// 函数内使用的正则：首次使用时编译一次（避免逐卡片重复编译）。
+macro_rules! re {
+    ($s:expr) => {{
+        static R: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new($s).unwrap());
+        &*R
+    }};
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RawLine {
     #[serde(default)]
@@ -32,6 +40,26 @@ pub struct RawCard {
     pub title_attr: String,
     pub nolink: bool,
     pub lines: Vec<RawLine>,
+    /// v26.03：平台提示选择器 / JSON-LD 读到的结构化字段（优先于文字块推断）
+    pub h: Option<HintFields>,
+}
+
+/// v26.03：按平台选择器直接读到的字段（全是原始文字，由 Rust 解析）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HintFields {
+    pub title: String,
+    pub price: String,
+    pub orig: String,
+    pub shop: String,
+    pub sales: String,
+    pub rating: String,
+    pub reviews: String,
+    pub location: String,
+    pub ship: String,
+    pub badges: Vec<String>,
+    /// json-ld 来源时价格已是纯数字 + 币种
+    pub currency: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -59,6 +87,12 @@ pub struct Candidate {
     pub shipping: Option<f64>,
     /// 券后 / 满减后 / 优惠后价格
     pub coupon_price: Option<f64>,
+    /// v26.03：卡片上的店铺 / 商品徽标（天猫、自营、旗舰店、Prime、Privat、Top Rated…）
+    #[serde(default)]
+    pub badges: Vec<String>,
+    /// v26.03：发货地
+    #[serde(default)]
+    pub location: Option<String>,
 }
 
 impl Candidate {
@@ -172,7 +206,7 @@ pub fn prices_in(text: &str, platform: &Platform) -> Vec<PriceHit> {
 }
 
 static SALES_CN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(\d+(?:\.\d+)?)\s*(万|w|W)?\+?\s*(?:人付款|人收货|人已买|人想要|件已售|已售|销量|人拼|条评价|笔成交|人购买)|(?:已拼|已售|已抢|月销|总销量|累计销量|销量)\s*(\d+(?:\.\d+)?)\s*(万|w|W)?\+?").unwrap()
+    Regex::new(r"(\d+(?:\.\d+)?)\s*(万|w|W)?\+?\s*(?:人付款|人收货|人已买|人想要|件已售|已售|销量|人拼|笔成交|人购买)|(?:已拼|已售|已抢|月销|总销量|累计销量|销量)\s*(\d+(?:\.\d+)?)\s*(万|w|W)?\+?").unwrap()
 });
 static SALES_EN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(\d+(?:[.,]\d+)?)\s*(k|K|万)?\+?\s*(?:sold|bought in past month|verkauft|Mal (?:im letzten Monat )?gekauft|件購入|個販売)").unwrap()
@@ -209,9 +243,9 @@ fn count(num: &str, unit: Option<&str>, locale: &str) -> Option<i64> {
 /// 合并被拆成多行的价格：`¥` / `189` / `.00` → `¥189.00`
 fn merge_lines(lines: &[RawLine]) -> Vec<RawLine> {
     let mut out: Vec<RawLine> = vec![];
-    let sym_only = Regex::new(r"^(?:[¥￥$€£]|US\s?\$|HK\$)$").unwrap();
-    let dec_only = Regex::new(r"^[.,]\d{1,2}$").unwrap();
-    let digits_only = Regex::new(r"^\d[\d.,]*$").unwrap();
+    let sym_only = re!(r"^(?:[¥￥$€£]|US\s?\$|HK\$)$");
+    let dec_only = re!(r"^[.,]\d{1,2}$");
+    let digits_only = re!(r"^\d[\d.,]*$");
     for l in lines {
         let t = l.t.trim();
         if t.is_empty() {
@@ -311,8 +345,96 @@ pub fn coupon_of(text: &str, price: Option<f64>) -> Option<f64> {
     best.map(round)
 }
 
+/// 卡片上常见的店铺 / 资质徽标（整行匹配，短文字）。
+static BADGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:天猫|天猫超市|天猫国际|淘宝直播|京东自营|自营|京东物流|京东超市|京东国际|旗舰店|官方旗舰店|官方|官方店|官方直营|品牌|品牌直营|品牌授权|企业|企业店|金牌卖家|源头工厂|超级工厂|实力商家|诚信通|深度验商|百亿补贴|品牌黑标|正品保障|假一赔[四十]|退货包运费|验货宝|个人闲置|个人|卖家信用极好|信用极好|芝麻信用[^\s]{0,4}|全球购|海外直邮|跨境|Amazon'?s Choice|Amazon Choice|Bestseller|Best Seller|#1 Best Seller|Top Rated(?: Plus)?|Top-Bewertung|Topbewertet|Prime|Privat(?:er (?:Verkäufer|Nutzer))?|Gewerblich(?:er Nutzer)?|Private seller|Business seller|Brand new|Refurbished|Generalüberholt|Gebraucht|Pre-owned|Used|Climate Pledge Friendly|Choice|Plus|Official Store|Offizieller Shop)$").unwrap()
+});
+
+pub fn badges_of(lines: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for t in extra.iter().chain(lines.iter()) {
+        let t = t.trim();
+        if t.is_empty() || t.chars().count() > 18 {
+            continue;
+        }
+        let ok = BADGE_RE.is_match(t) || extra.iter().any(|e| e.trim() == t);
+        if ok && !out.iter().any(|o| o == t) {
+            out.push(t.to_string());
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    out
+}
+
+static TITLE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:\s*(?:广告|推广|Sponsored(?: Ad)?|Gesponsert(?:e Anzeige)?|Anzeige|Werbung|Neues Angebot|New Listing|NEU!?|Ad)\s*[-–—:|·]?\s*)+").unwrap()
+});
+
+/// 标题清洗：去掉"广告 / Gesponsert / Neues Angebot"等前缀、多余空白；长度上限 300。
+pub fn clean_title(t: &str) -> String {
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = TITLE_PREFIX.replace(&t, "").to_string();
+    t.trim_matches(|c: char| c == '|' || c == '-' || c == '–' || c.is_whitespace()).chars().take(300).collect()
+}
+
+/// 提示字段里的价格：带币种的文字优先；纯数字（如京东 `.p-price i`）用平台币种。
+fn hint_price(text: &str, currency: &str, platform: &Platform) -> Option<PriceHit> {
+    let t: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // "¥ 1299 .00" → "¥1299.00"
+    let t = re!(r"([¥￥$€£])\s+(\d)").replace_all(&t, "$1$2").to_string();
+    let t = re!(r"(\d)\s+([.,]\d{1,2})\b").replace_all(&t, "$1$2").to_string();
+    if let Some(h) = prices_in(&t, platform).into_iter().next() {
+        return Some(h);
+    }
+    let num = re!(r"\d[\d.,\s]*").find(&t)?.as_str().trim().to_string();
+    let v = parse_number(&num, &platform.locale)?;
+    (v > 0.0 && v < 10_000_000.0).then(|| PriceHit { value: v, currency: if currency.len() == 3 { currency.to_uppercase() } else { platform.currency.clone() } })
+}
+
+/// 销量文字：月销 1000+ / 已售 5万+ / 10万+人付款 / 1K+ bought in past month / 23 verkauft。
+pub fn parse_sales(text: &str, locale: &str) -> Option<i64> {
+    SALES_CN
+        .captures(text)
+        .and_then(|c| if let Some(n) = c.get(1) { count(n.as_str(), c.get(2).map(|m| m.as_str()), "zh") } else { count(&c[3], c.get(4).map(|m| m.as_str()), "zh") })
+        .or_else(|| SALES_EN.captures(text).and_then(|c| count(&c[1], c.get(2).map(|m| m.as_str()), locale)))
+}
+
+fn parse_reviews_count(text: &str, locale: &str) -> Option<i64> {
+    if let Some(c) = REVIEWS_RE.captures(text) {
+        let raw = c[1].trim().to_string();
+        let (num, unit) = if let Some(n) = raw.strip_suffix('万') { (n.trim().to_string(), Some("万")) } else if let Some(n) = raw.strip_suffix(['k', 'K']) { (n.trim().to_string(), Some("k")) } else { (raw, None) };
+        return count(&num, unit, locale);
+    }
+    // 只有数字：京东 "2万+"、亚马逊 "(1.234)" / "1,234"
+    let t = text.trim().trim_matches(|c| c == '(' || c == ')' || c == '+').trim();
+    let re = re!(r"^(\d[\d.,]*)\s*(万|[kK])?\+?$");
+    re.captures(t).and_then(|c| count(&c[1], c.get(2).map(|m| m.as_str()), locale))
+}
+
+fn parse_rating(text: &str) -> Option<f64> {
+    RATING_RE
+        .captures(text)
+        .and_then(|c| c[1].replace(',', ".").parse::<f64>().ok())
+        .or_else(|| {
+            let t = text.trim();
+            re!(r"^([0-5](?:[.,]\d)?)$").captures(t).and_then(|c| c[1].replace(',', ".").parse::<f64>().ok())
+        })
+        .filter(|r| *r > 0.0 && *r <= 5.0)
+}
+
 pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Candidate> {
-    let lines = merge_lines(&raw.lines);
+    let mut lines = merge_lines(&raw.lines);
+    let hint = raw.h.clone().unwrap_or_default();
+    if lines.is_empty() {
+        // JSON-LD / 提示字段来源但没有文字块时，用字段合成
+        for t in [&hint.title, &hint.price, &hint.shop, &hint.sales] {
+            if !t.trim().is_empty() {
+                lines.push(RawLine { t: t.trim().to_string(), fs: 14.0, fw: 400.0, a: false, s: false });
+            }
+        }
+    }
     if lines.is_empty() {
         return None;
     }
@@ -333,19 +455,30 @@ pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Can
             }
         }
     }
-    let (price, currency) = match &best {
-        Some((_, h)) => (Some(h.value), h.currency.clone()),
-        None => (None, platform.currency.clone()),
+    let hinted_price = (!hint.price.trim().is_empty()).then(|| hint_price(&hint.price, &hint.currency, platform)).flatten();
+    let (price, currency) = match (&hinted_price, &best) {
+        (Some(h), _) => (Some(h.value), h.currency.clone()),
+        (None, Some((_, h))) => (Some(h.value), h.currency.clone()),
+        (None, None) => (None, platform.currency.clone()),
     };
+    if let Some(o) = (!hint.orig.trim().is_empty()).then(|| hint_price(&hint.orig, &hint.currency, platform)).flatten() {
+        original = Some(o.value);
+    }
     let original_price = original.filter(|o| price.is_none_or(|p| *o > p));
-    let line_texts: Vec<String> = lines.iter().map(|l| l.t.clone()).collect();
+    let mut line_texts: Vec<String> = lines.iter().map(|l| l.t.clone()).collect();
+    if !hint.ship.trim().is_empty() {
+        line_texts.push(hint.ship.trim().to_string());
+    }
     let shipping = shipping_of(&line_texts, platform, price, &currency);
     let coupon_price = coupon_of(&text, price);
 
     // 标题：title 属性 > 链接文字最长行 > 字号最大的长行 > 最长行
     let ok = |t: &str| !is_junk(t, platform) && t.chars().count() >= 4;
     let attr = raw.title_attr.trim();
-    let title = if attr.chars().count() >= 6 && !is_junk(attr, platform) {
+    let hinted_title = clean_title(&hint.title);
+    let title = if hinted_title.chars().count() >= 6 && !is_junk(&hinted_title, platform) {
+        hinted_title
+    } else if attr.chars().count() >= 6 && !is_junk(attr, platform) {
         attr.to_string()
     } else {
         let linked = lines.iter().filter(|l| l.a && ok(&l.t)).max_by_key(|l| l.t.chars().count()).map(|l| l.t.clone());
@@ -357,28 +490,36 @@ pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Can
         let longest = lines.iter().filter(|l| ok(&l.t)).max_by_key(|l| l.t.chars().count()).map(|l| l.t.clone());
         linked.filter(|t| t.chars().count() >= 8).or(big).or(longest)?
     };
-    let title: String = title.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
-    if title.chars().count() < 4 {
+    let title = clean_title(&title);
+    if title.chars().count() < 4 || PLACEHOLDER_TITLE.is_match(&title) {
         return None;
     }
 
-    let sales = SALES_CN
-        .captures(&text)
-        .and_then(|c| if let Some(n) = c.get(1) { count(n.as_str(), c.get(2).map(|m| m.as_str()), "zh") } else { count(&c[3], c.get(4).map(|m| m.as_str()), "zh") })
-        .or_else(|| SALES_EN.captures(&text).and_then(|c| count(&c[1], c.get(2).map(|m| m.as_str()), &platform.locale)));
-    let rating = RATING_RE.captures(&text).and_then(|c| c[1].replace(',', ".").parse::<f64>().ok()).filter(|r| *r <= 5.0);
-    let reviews = REVIEWS_RE.captures(&text).and_then(|c| {
-        let raw = c[1].trim().to_string();
-        let (num, unit) = if let Some(n) = raw.strip_suffix('万') { (n.trim().to_string(), Some("万")) } else if let Some(n) = raw.strip_suffix(['k', 'K']) { (n.trim().to_string(), Some("k")) } else { (raw, None) };
-        count(&num, unit, &platform.locale)
+    let sales = (!hint.sales.trim().is_empty())
+        .then(|| parse_sales(&hint.sales, &platform.locale).or_else(|| parse_reviews_count(&hint.sales, &platform.locale).filter(|_| hint.sales.contains(['+', '万']))))
+        .flatten()
+        .or_else(|| parse_sales(&text, &platform.locale));
+    let rating = (!hint.rating.trim().is_empty()).then(|| parse_rating(&hint.rating)).flatten().or_else(|| {
+        RATING_RE.captures(&text).and_then(|c| c[1].replace(',', ".").parse::<f64>().ok()).filter(|r| *r <= 5.0)
     });
-    let shop = lines.iter().find_map(|l| {
-        let t = l.t.trim();
-        if t == title || t.chars().count() > 40 {
-            return None;
-        }
-        SHOP_RE.captures(t).map(|c| (2..=6).find_map(|i| c.get(i).map(|m| m.as_str().to_string())).unwrap_or_else(|| t.to_string()))
-    });
+    let reviews = (!hint.reviews.trim().is_empty())
+        .then(|| parse_reviews_count(&hint.reviews, &platform.locale))
+        .flatten()
+        .or_else(|| parse_reviews_count_in(&text, &platform.locale));
+    let hinted_shop = hint.shop.trim();
+    let shop = if !hinted_shop.is_empty() && hinted_shop.chars().count() <= 40 {
+        Some(clean_shop(hinted_shop))
+    } else {
+        lines.iter().find_map(|l| {
+            let t = l.t.trim();
+            if t == title || t.chars().count() > 40 {
+                return None;
+            }
+            SHOP_RE.captures(t).map(|c| (2..=6).find_map(|i| c.get(i).map(|m| m.as_str().to_string())).unwrap_or_else(|| t.to_string()))
+        })
+    };
+    let badges = badges_of(&line_texts, &hint.badges);
+    let location = Some(hint.location.trim().to_string()).filter(|l| !l.is_empty() && l.chars().count() <= 20);
     let low = text.to_lowercase();
     let condition = if ["二手", "闲置", "gebraucht", "pre-owned", "used", "refurbished", "generalüberholt", "翻新", "中古"].iter().any(|w| low.contains(w)) {
         "used"
@@ -435,7 +576,34 @@ pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Can
         query: query.to_string(),
         shipping,
         coupon_price,
+        badges,
+        location,
     })
+}
+
+static PLACEHOLDER_TITLE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:Shop on eBay|Bei eBay einkaufen|Results matching fewer words|Ergebnisse mit weniger Suchbegriffen)$").unwrap()
+});
+
+fn parse_reviews_count_in(text: &str, locale: &str) -> Option<i64> {
+    REVIEWS_RE.captures(text).and_then(|c| {
+        let raw = c[1].trim().to_string();
+        let (num, unit) = if let Some(n) = raw.strip_suffix('万') { (n.trim().to_string(), Some("万")) } else if let Some(n) = raw.strip_suffix(['k', 'K']) { (n.trim().to_string(), Some("k")) } else { (raw, None) };
+        count(&num, unit, locale)
+    })
+}
+
+/// 店铺名清洗：去掉"进店 / 进入店铺 / Visit the … Store"包装。
+fn clean_shop(t: &str) -> String {
+    let t = t.trim();
+    if let Some(c) = SHOP_RE.captures(t) {
+        if let Some(m) = (2..=6).find_map(|i| c.get(i)) {
+            return m.as_str().trim().to_string();
+        }
+    }
+    // eBay："seller-name (1.234) 99,8%" → 卖家名
+    let t = re!(r"\s*\(\d[\d.,]*\)\s*(?:\d{1,3}(?:[.,]\d)?\s*%)?\s*$").replace(t, "").to_string();
+    t.trim_end_matches("进店").trim_end_matches('>').trim_end_matches("进入店铺").trim().chars().take(40).collect()
 }
 
 #[cfg(test)]
@@ -572,5 +740,55 @@ mod tests {
         let raw2 = RawCard { id: "123456789".into(), nolink: true, lines: raw.lines.clone(), ..Default::default() };
         let c2 = parse_card(&plat("pinduoduo"), &raw2, "x").unwrap();
         assert_eq!(c2.url, "https://mobile.yangkeduo.com/goods.html?goods_id=123456789");
+    }
+
+    fn hcard(h: HintFields, lines: &[&str]) -> RawCard {
+        RawCard { id: "1".into(), href: "https://x/1".into(), lines: lines.iter().map(|t| l(t, 13.0)).collect(), h: Some(h), ..Default::default() }
+    }
+
+    #[test]
+    fn hinted_fields_win() {
+        let jd = plat("jd");
+        let c = parse_card(&jd, &hcard(HintFields { title: "广告 索尼 WH-1000XM5 降噪耳机".into(), price: "2299.00".into(), shop: "索尼京东自营官方旗舰店".into(),
+            reviews: "2万+".into(), badges: vec!["自营".into(), "放心购".into()], ..Default::default() }, &["索尼 WH-1000XM5 降噪耳机", "¥2299.00", "2万+条评价"]), "q").unwrap();
+        assert_eq!(c.title, "索尼 WH-1000XM5 降噪耳机");
+        assert_eq!(c.price, Some(2299.0));
+        assert_eq!(c.currency, "CNY");
+        assert_eq!(c.shop.as_deref(), Some("索尼京东自营官方旗舰店"));
+        assert_eq!(c.reviews, Some(20000));
+        assert!(c.badges.contains(&"自营".to_string()) && c.badges.contains(&"放心购".to_string()));
+
+        let tb = plat("taobao");
+        let c = parse_card(&tb, &hcard(HintFields { title: "Sony/索尼 WH-1000XM5".into(), price: "¥ 1799 .00".into(), sales: "3000+人付款".into(),
+            location: "广东 深圳".into(), ..Default::default() }, &["天猫", "Sony/索尼 WH-1000XM5"]), "q").unwrap();
+        assert_eq!(c.price, Some(1799.0));
+        assert_eq!(c.sales, Some(3000));
+        assert_eq!(c.location.as_deref(), Some("广东 深圳"));
+        assert!(c.badges.contains(&"天猫".to_string()));
+
+        let de = plat("amazon_de");
+        let c = parse_card(&de, &hcard(HintFields { title: "Gesponsert Sony WH-1000XM5 Kopfhörer".into(), price: "279,00 €".into(), orig: "419,00 €".into(),
+            rating: "4,6 von 5 Sternen".into(), reviews: "12.345".into(), sales: "1K+ bought in past month".into(), ..Default::default() }, &[]), "q").unwrap();
+        assert_eq!(c.title, "Sony WH-1000XM5 Kopfhörer");
+        assert_eq!((c.price, c.original_price), (Some(279.0), Some(419.0)));
+        assert_eq!(c.rating, Some(4.6));
+        assert_eq!(c.reviews, Some(12345));
+        assert_eq!(c.sales, Some(1000));
+    }
+
+    #[test]
+    fn ld_and_placeholders() {
+        let eb = plat("ebay_de");
+        let ld = RawCard { id: "".into(), href: "https://www.ebay.de/itm/1".into(), h: Some(HintFields { title: "Sony WH-1000XM5".into(), price: "199.5".into(), currency: "EUR".into(), ..Default::default() }), ..Default::default() };
+        let c = parse_card(&eb, &ld, "q").unwrap();
+        assert_eq!((c.price, c.currency.as_str()), (Some(199.5), "EUR"));
+        let ph = hcard(HintFields { title: "Shop on eBay".into(), price: "20,00 EUR".into(), ..Default::default() }, &["Shop on eBay", "20,00 EUR"]);
+        assert!(parse_card(&eb, &ph, "q").is_none());
+        assert_eq!(clean_title("Neues Angebot  Sony   WH-1000XM5 "), "Sony WH-1000XM5");
+        assert_eq!(parse_sales("月销 1000+", "zh-CN"), Some(1000));
+        assert_eq!(parse_sales("已售 5万+", "zh-CN"), Some(50000));
+        assert_eq!(parse_sales("23 verkauft", "de-DE"), Some(23));
+        assert_eq!(parse_sales("2万+条评价", "zh-CN"), None, "评价数不是销量");
+        assert_eq!(clean_shop("kopfhoerer-fan (512) 100%"), "kopfhoerer-fan");
     }
 }

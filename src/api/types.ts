@@ -31,6 +31,12 @@ export interface SearchPrefs {
   defaultRegion: "all" | Region;
   /** 保活：定期访问已登录平台首页 */
   keepalive: boolean;
+  /** v26.03 检索深度：quick 不看评论 · standard 前 reviewTop 件读评论 · deep 更多商品 + 店铺评价 */
+  depth: "quick" | "standard" | "deep";
+  /** 读取评论的商品数 */
+  reviewTop: number;
+  /** 自动折叠高风险商品 */
+  hideHighRisk: boolean;
 }
 
 export interface NotifyPrefs {
@@ -109,6 +115,8 @@ export interface AiPreset {
   keyUrl: string;
   note: string;
   region: Region | "local";
+  /** v26.03：已停用 / 不再推荐的模型 ID */
+  retired?: string[];
 }
 
 export interface AiUsage {
@@ -173,8 +181,21 @@ export interface LoginState {
   lastWallAt?: string | null;
   cookieExpires?: string | null;
   message?: string | null;
-  /** 与此平台共享登录的其他平台 id */
-  sharedWith: string[];
+  /** v26.03：最近一次主动验证（打开账号页确认没有跳到登录页）的时间 */
+  checkedAt?: string | null;
+  /** v26.03：本机有会话备份（浏览器意外丢失 Cookie 时自动恢复） */
+  vaulted?: boolean;
+}
+
+/** v26.03：搜索前的登录预检 */
+export interface LoginCheck {
+  platformId: string;
+  need: LoginNeed;
+  status: LoginStatus;
+  /** 可以直接搜索（已登录或不需要登录） */
+  ok: boolean;
+  verifiedNow: boolean;
+  message?: string | null;
 }
 
 export interface BrowserInfo {
@@ -221,6 +242,8 @@ export interface SearchPlan {
   currency: string;
   condition: Condition;
   platforms: string[];
+  /** v26.03：平台由用户指定（选择器 / 指令点名）；指定平台必须先登录 */
+  platformsExplicit?: boolean;
   queries: PlatformQuery[];
   sort: SortKey;
   limit: number;
@@ -230,7 +253,13 @@ export interface SearchPlan {
 }
 
 export type RunStatus = "running" | "done" | "error" | "cancelled" | "interrupted";
-export type Stage = "plan" | "search" | "extract" | "verify" | "rank" | "summarize" | "done";
+/**
+ * v26.03 搜索阶段：理解需求 → 平台判定 → 多平台搜索 → 粗筛 → 商品风险 → 店铺可信度 → 评论检索 → 评论分析 → 最终细筛 → 总结。
+ * extract / verify / rank 为 v26.02 及以前的阶段名（回放旧记录时出现）。
+ */
+export type Stage =
+  | "plan" | "platforms" | "search" | "screen" | "risk" | "shop" | "reviews" | "review_ai" | "final" | "summarize" | "done"
+  | "extract" | "verify" | "rank";
 export type PlatformRunState = "queued" | "searching" | "waiting_user" | "done" | "error" | "skipped" | "login_required";
 export type Verdict = "exact" | "close" | "related" | "mismatch";
 
@@ -287,6 +316,75 @@ export interface DealInfo {
   days: number;
 }
 
+/** v26.03 结果标签 */
+export type TagTone = "good" | "neutral" | "warn" | "bad";
+export interface ItemTag {
+  /** flagship | official | self_operated | authorized | distributor | enterprise | individual | studio | overseas | secondhand | marketplace | free_shipping | good_deal | high_sales | well_reviewed | risk … */
+  kind: string;
+  label: string;
+  tone: TagTone;
+}
+
+export type ShopKind =
+  | "flagship" | "official" | "self_operated" | "authorized" | "distributor" | "enterprise"
+  | "individual" | "studio" | "overseas" | "secondhand" | "marketplace" | "unknown";
+
+/** v26.03 店铺信息与可信度 */
+export interface ShopInfo {
+  name?: string | null;
+  kind: ShopKind;
+  label: string;
+  /** 0–5 */
+  rating?: number | null;
+  /** 描述 / 服务 / 物流（0–5）或 好评率（0–100） */
+  scores: Record<string, number>;
+  years?: number | null;
+  followers?: number | null;
+  /** 0–100，越高越可信 */
+  credibility: number;
+  notes: string[];
+}
+
+export interface RiskFactor {
+  kind: string;
+  label: string;
+  weight: number;
+}
+
+/** v26.03 商品风险：score 越高风险越大 */
+export interface RiskInfo {
+  score: number;
+  level: "low" | "medium" | "high";
+  factors: RiskFactor[];
+  summary: string;
+  aiChecked: boolean;
+}
+
+/** v26.03 评论检索与分析 */
+export interface ReviewInsight {
+  rating?: number | null;
+  count?: number | null;
+  goodRate?: number | null;
+  sampled: number;
+  pros: string[];
+  cons: string[];
+  redFlags: string[];
+  matchNote?: string | null;
+  score?: number | null;
+  source: "product" | "product+shop" | "shop" | "none";
+  snippets: string[];
+  shopNote?: string | null;
+  unavailableReason?: string | null;
+  aiChecked: boolean;
+  fetchedAt?: string | null;
+}
+
+export interface PlatformSkip {
+  platformId: string;
+  reason: "login_required" | "disabled" | "not_relevant" | "region" | string;
+  message: string;
+}
+
 export interface ResultItem {
   id: string;
   platformId: string;
@@ -327,6 +425,13 @@ export interface ResultItem {
   provisional?: boolean;
   /** 用户反馈："irrelevant" = 标记为不相关 */
   feedback?: string | null;
+  /** v26.03 */
+  tags?: ItemTag[];
+  shopInfo?: ShopInfo | null;
+  risk?: RiskInfo | null;
+  reviewInsight?: ReviewInsight | null;
+  /** 最终细筛综合分 0–100 */
+  finalScore?: number | null;
 }
 
 export interface AiSummary {
@@ -356,6 +461,8 @@ export type RunEventBody =
   | { type: "filter"; fetched: number; kept: number; dropped: Record<string, number>; duplicates: number }
   | { type: "verify"; checked: number; matched: number; hidden: number }
   | { type: "partial"; platformId: string; items: ResultItem[] }
+  | { type: "platform_plan"; chosen: string[]; skipped: PlatformSkip[]; reason: string }
+  | { type: "funnel"; stage: Stage; label: string; input: number; kept: number; note?: string | null }
   | { type: "results"; items: ResultItem[] }
   | { type: "summary"; summary: AiSummary }
   | { type: "log"; level: "info" | "warn" | "error"; message: string }
@@ -525,16 +632,22 @@ export interface MarketOverview {
 }
 
 /* ------------------------------------------------------------------ Copilot */
+/** auto = true：用户明确要求"用 app 去做"，收到后由界面直接执行（v26.03） */
 export type CopilotAction =
-  | { type: "search"; label: string; instruction: string }
-  | { type: "watch"; label: string; listingId: string; targetPrice?: number | null }
-  | { type: "open"; label: string; url: string }
-  | { type: "navigate"; label: string; route: string };
+  | { type: "search"; label: string; instruction: string; platforms?: string[] | null; auto?: boolean }
+  | { type: "watch"; label: string; listingId: string; targetPrice?: number | null; url?: string | null; auto?: boolean }
+  | { type: "open"; label: string; url: string; auto?: boolean }
+  | { type: "navigate"; label: string; route: string; auto?: boolean }
+  | { type: "monitor"; label: string; instruction: string; intervalMinutes?: number | null; targetPrice?: number | null; auto?: boolean }
+  | { type: "login"; label: string; platformId: string; auto?: boolean }
+  | { type: "setting"; label: string; key: "theme" | "displayCurrency" | "role" | "depth" | "region" | string; value: string; auto?: boolean }
+  | { type: "results"; label: string; op: "export_csv" | "copy_list" | "filter_exact" | "sort_landed" | "cancel" | string; auto?: boolean };
 
 export interface CopilotMessage {
   id: string;
   sessionId: string;
-  role: "user" | "assistant";
+  /** event（v26.03）：App 发给 Copilot 的事件（例如 Copilot 发起的搜索已完成），不是用户说的话 */
+  role: "user" | "assistant" | "event";
   content: string;
   actions: CopilotAction[];
   createdAt: string;
@@ -555,6 +668,8 @@ export interface CopilotSendInput {
   skill?: string;
   /** 前端打包的精简上下文（当前结果/选中商品等） */
   context?: unknown;
+  /** v26.03：chat（默认）| run_followup（Copilot 发起的搜索完成后，App 自动请它点评结果） */
+  kind?: "chat" | "run_followup";
 }
 
 /* ------------------------------------------------------------------ 杂项 */
@@ -578,8 +693,10 @@ export interface Bootstrap {
 }
 
 export interface AppError {
-  code: "AI_REQUIRED" | "NOT_FOUND" | "BROWSER" | "LOGIN" | "AI" | "INVALID" | "INTERNAL" | "CANCELLED";
+  code: "AI_REQUIRED" | "NOT_FOUND" | "BROWSER" | "LOGIN" | "LOGIN_REQUIRED" | "AI" | "INVALID" | "INTERNAL" | "CANCELLED";
   message: string;
+  /** v26.03：LOGIN_REQUIRED 时需要先登录的平台 id */
+  platforms?: string[];
 }
 
 /* ------------------------------------------------------------------ 事件载荷 */
@@ -649,5 +766,11 @@ export interface SelfTestResult {
   samples: SelfTestSample[];
   ms: number;
   loginRequired: boolean;
+  message?: string | null;
+}
+
+/** v26.03：服务商 /models 返回的可用模型 */
+export interface ModelList {
+  models: string[];
   message?: string | null;
 }

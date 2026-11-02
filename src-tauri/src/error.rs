@@ -7,13 +7,20 @@ use serde::Serialize;
 pub struct AppError {
     pub code: &'static str,
     pub message: String,
+    /// v26.03：LOGIN_REQUIRED 时列出需要先登录的平台 id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<Vec<String>>,
 }
 
 pub type AppResult<T> = Result<T, AppError>;
 
 impl AppError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), platforms: None }
+    }
+    /// v26.03：所选平台需要先登录
+    pub fn login_required(names: &[String], ids: Vec<String>) -> Self {
+        Self { code: "LOGIN_REQUIRED", message: format!("请先登录：{}（登录后再搜索）", names.join("、")), platforms: Some(ids) }
     }
     pub fn ai_required() -> Self {
         Self::new("AI_REQUIRED", "需要先连接 AI 模型：请到「设置 · AI 模型」填写并测试连接")

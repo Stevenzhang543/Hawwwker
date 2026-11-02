@@ -18,6 +18,12 @@ pub struct SearchPrefs {
     pub result_limit: u32,
     pub default_region: String,
     pub keepalive: bool,
+    /// v26.03 检索深度：quick（不看评论）| standard（前 N 件读评论）| deep（更多商品 + 店铺评价）
+    pub depth: String,
+    /// standard / deep 下读取评论的商品数
+    pub review_top: u32,
+    /// 自动隐藏高风险商品（折叠到"可能不相关 / 高风险"）
+    pub hide_high_risk: bool,
 }
 
 impl Default for SearchPrefs {
@@ -33,6 +39,9 @@ impl Default for SearchPrefs {
             result_limit: 40,
             default_region: "all".into(),
             keepalive: true,
+            depth: "standard".into(),
+            review_top: 6,
+            hide_high_risk: true,
         }
     }
 }
@@ -154,6 +163,9 @@ pub struct AiPreset {
     pub key_url: String,
     pub note: String,
     pub region: String,
+    /// v26.03：已停用 / 不再推荐的模型 ID（界面提示更换）
+    #[serde(default)]
+    pub retired: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -237,7 +249,26 @@ pub struct LoginState {
     pub last_wall_at: Option<String>,
     pub cookie_expires: Option<String>,
     pub message: Option<String>,
-    pub shared_with: Vec<String>,
+    /// v26.03：最近一次主动验证（打开账号页确认未跳登录）的时间
+    pub checked_at: Option<String>,
+    /// v26.03：本机是否有会话备份（浏览器意外丢失 Cookie 时自动恢复）
+    pub vaulted: bool,
+}
+
+/// v26.03：搜索前的登录预检结果。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LoginCheck {
+    pub platform_id: String,
+    /// required | recommended | optional
+    pub need: String,
+    /// 与 LoginState.status 相同
+    pub status: String,
+    /// 可以直接搜索（已登录，或不需要登录）
+    pub ok: bool,
+    /// 这次预检是否做了主动验证
+    pub verified_now: bool,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -292,6 +323,8 @@ pub struct SearchPlan {
     pub currency: String,
     pub condition: String,
     pub platforms: Vec<String>,
+    /// v26.03：平台由用户指定（选择器或在指令里点名），而不是 AI / 默认选择；指定的平台必须先登录
+    pub platforms_explicit: bool,
     pub queries: Vec<PlatformQuery>,
     pub sort: String,
     pub limit: u32,
@@ -313,6 +346,7 @@ impl Default for SearchPlan {
             currency: "CNY".into(),
             condition: "any".into(),
             platforms: vec![],
+            platforms_explicit: false,
             queries: vec![],
             sort: "relevance".into(),
             limit: 40,
@@ -391,6 +425,105 @@ pub struct DealInfo {
     pub days: u32,
 }
 
+/// v26.03：结果标签。tone：good | neutral | warn | bad
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ItemTag {
+    /// flagship | official | self_operated | authorized | distributor | enterprise | individual | studio | overseas
+    /// | secondhand | marketplace | free_shipping | good_deal | high_sales | well_reviewed | risk | …
+    pub kind: String,
+    pub label: String,
+    pub tone: String,
+}
+
+/// v26.03：店铺信息与可信度。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ShopInfo {
+    pub name: Option<String>,
+    /// flagship 旗舰店 | official 官方店 | self_operated 平台自营 | authorized 专卖店/授权 | distributor 专营店
+    /// | enterprise 企业店 | individual 个人卖家 | studio 小工作室 | overseas 海外/代购 | secondhand 二手商家
+    /// | marketplace 第三方卖家 | unknown
+    pub kind: String,
+    pub label: String,
+    /// 店铺评分，统一到 0–5
+    pub rating: Option<f64>,
+    /// 细项评分，例如 描述 / 服务 / 物流（0–5）或 好评率（0–100）
+    pub scores: BTreeMap<String, f64>,
+    /// 开店年限
+    pub years: Option<f64>,
+    pub followers: Option<u64>,
+    /// 可信度 0–100（越高越可信）
+    pub credibility: u32,
+    /// 依据（中文短句）
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RiskFactor {
+    /// counterfeit | price_anomaly | used | refurbished | accessory | function | spec_mismatch | shop | reviews | no_reviews | new_seller | overseas | other
+    pub kind: String,
+    pub label: String,
+    /// 对风险分的贡献（正数加风险，负数减风险）
+    pub weight: i32,
+}
+
+/// v26.03：商品风险评估。score 越高风险越大。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RiskInfo {
+    pub score: u32,
+    /// low | medium | high
+    pub level: String,
+    pub factors: Vec<RiskFactor>,
+    /// 一句话结论
+    pub summary: String,
+    pub ai_checked: bool,
+}
+
+/// v26.03：评论检索与分析结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReviewInsight {
+    /// 商品评分（0–5）
+    pub rating: Option<f64>,
+    /// 评论总数
+    pub count: Option<u64>,
+    /// 好评率（0–100）
+    pub good_rate: Option<f64>,
+    /// 实际读取的评论条数
+    pub sampled: u32,
+    pub pros: Vec<String>,
+    pub cons: Vec<String>,
+    /// 假货、质量、售后等风险信号
+    pub red_flags: Vec<String>,
+    /// 与用户需求的对应（例如"多条评论提到降噪效果好"）
+    pub match_note: Option<String>,
+    /// 评论综合分 0–100
+    pub score: Option<u32>,
+    /// product | product+shop | shop | none
+    pub source: String,
+    /// 代表性评论原文（≤5 条，截断）
+    pub snippets: Vec<String>,
+    /// 店铺评价摘要
+    pub shop_note: Option<String>,
+    /// none = 没读到评论（需要登录、页面无评论等）时的原因
+    pub unavailable_reason: Option<String>,
+    pub ai_checked: bool,
+    pub fetched_at: Option<String>,
+}
+
+/// v26.03：平台判定结果中被跳过的平台。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PlatformSkip {
+    pub platform_id: String,
+    /// login_required | disabled | not_relevant | region
+    pub reason: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultItem {
@@ -417,6 +550,21 @@ pub struct ResultItem {
     pub provisional: bool,
     /// 用户反馈：irrelevant = 标记为不相关
     pub feedback: Option<String>,
+    /// v26.03：最终标签（旗舰店 / 官方店 / 平台自营 / 个人卖家 / 小工作室 / 包邮 / 好价 …）
+    #[serde(default)]
+    pub tags: Vec<ItemTag>,
+    /// v26.03：店铺信息与可信度
+    #[serde(default)]
+    pub shop_info: Option<ShopInfo>,
+    /// v26.03：商品风险（正品、功能、二手、价格异常…）
+    #[serde(default)]
+    pub risk: Option<RiskInfo>,
+    /// v26.03：评论检索与分析（商品评论 + 店铺评价）
+    #[serde(default)]
+    pub review_insight: Option<ReviewInsight>,
+    /// v26.03：最终细筛综合分 0–100（匹配、风险、店铺、评论、价格加权）
+    #[serde(default)]
+    pub final_score: Option<u32>,
     pub sales: Option<i64>,
     pub rating: Option<f64>,
     pub reviews: Option<i64>,
@@ -480,6 +628,10 @@ pub enum RunEventBody {
     },
     Filter { fetched: u32, kept: u32, dropped: BTreeMap<String, u32>, duplicates: u32 },
     Verify { checked: u32, matched: u32, hidden: u32 },
+    /// v26.03 平台判定：最终参与搜索的平台、跳过的平台与理由
+    PlatformPlan { chosen: Vec<String>, skipped: Vec<PlatformSkip>, reason: String },
+    /// v26.03 漏斗：每个筛选阶段的输入 / 保留数量
+    Funnel { stage: String, label: String, input: u32, kept: u32, note: Option<String> },
     /// 渐进式结果：某个平台搜完立即推送（规则初判）
     Partial {
         #[serde(rename = "platformId")]
@@ -755,16 +907,73 @@ pub struct MarketOverview {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CopilotAction {
-    Search { label: String, instruction: String },
+    /// auto = true：用户明确要求"用 app 去做"，界面收到后直接执行（v26.03）
+    Search {
+        label: String,
+        instruction: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platforms: Option<Vec<String>>,
+        #[serde(default)]
+        auto: bool,
+    },
     Watch {
         label: String,
-        #[serde(rename = "listingId")]
+        #[serde(rename = "listingId", default)]
         listing_id: String,
         #[serde(rename = "targetPrice", default)]
         target_price: Option<f64>,
+        /// 直接用商品链接追踪（listingId 为空时）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default)]
+        auto: bool,
     },
-    Open { label: String, url: String },
-    Navigate { label: String, route: String },
+    Open {
+        label: String,
+        url: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    Navigate {
+        label: String,
+        route: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// v26.03：创建定时监控
+    Monitor {
+        label: String,
+        instruction: String,
+        #[serde(rename = "intervalMinutes", default)]
+        interval_minutes: Option<u32>,
+        #[serde(rename = "targetPrice", default)]
+        target_price: Option<f64>,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// v26.03：发起某个平台的登录
+    Login {
+        label: String,
+        #[serde(rename = "platformId")]
+        platform_id: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// v26.03：修改设置。key：theme | displayCurrency | role | depth | region
+    Setting {
+        label: String,
+        key: String,
+        value: String,
+        #[serde(default)]
+        auto: bool,
+    },
+    /// v26.03：对当前搜索结果的操作。op：export_csv | copy_list | filter_exact | sort_landed | cancel
+    Results {
+        label: String,
+        op: String,
+        #[serde(default)]
+        auto: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -796,6 +1005,10 @@ pub struct CopilotSendInput {
     pub text: String,
     pub skill: Option<String>,
     pub context: Option<Value>,
+    /// v26.03：chat（默认）| run_followup（Copilot 发起的搜索完成后，App 自动请它点评结果；
+    /// 这条输入以 role = "event" 保存，界面显示为事件而不是用户气泡）
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -966,6 +1179,15 @@ mod tests {
     fn copilot_action_tagged() {
         let a: CopilotAction =
             serde_json::from_str(r#"{"type":"watch","label":"x","listingId":"l1","targetPrice":9.5}"#).unwrap();
-        assert_eq!(a, CopilotAction::Watch { label: "x".into(), listing_id: "l1".into(), target_price: Some(9.5) });
+        assert_eq!(a, CopilotAction::Watch { label: "x".into(), listing_id: "l1".into(), target_price: Some(9.5), url: None, auto: false });
     }
+}
+
+/// v26.03：服务商 /models 接口返回的可用模型。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelList {
+    pub models: Vec<String>,
+    /// 错误时的说明（例如 Key 无效、服务商不支持列出模型）
+    pub message: Option<String>,
 }

@@ -12,6 +12,7 @@ import type {
 import {
   FX, PRESETS, SKILLS, fxConvert, hash, makeLogins, makeNotices, makePlatforms, productImage, rng, uid,
 } from "./mockData";
+import { mockFinal, mockReviews, mockRisk, mockShop, mockTags } from "./mockInsight";
 
 /* ================================================================ 事件总线 */
 const listeners = new Map<string, Set<(p: unknown) => void>>();
@@ -52,18 +53,19 @@ const settings: AppSettings = {
   search: {
     maxQueries: 2, perPlatform: 20, concurrency: 3, background: true, loginWaitSecs: 120, popupOnLogin: false,
     platformTimeoutSecs: 120, resultLimit: 30, defaultRegion: "all", keepalive: true,
+    depth: "standard", reviewTop: 6, hideHighRisk: true,
   },
   notify: { system: true, dropPercent: 5, webhookKind: "none", webhookUrl: "" },
 };
 
 let aiConfig: AiConfig = {
-  protocol: "openai", provider: "deepseek", baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat", fastModel: "",
+  protocol: "openai", provider: "deepseek", baseUrl: "https://api.deepseek.com", model: params.has("oldmodel") ? "deepseek-chat" : "deepseek-flash", fastModel: "",
   temperature: 0.2, timeoutSecs: 60, maxConcurrency: 3, hasKey: !NO_AI, keyHint: NO_AI ? "" : "••••7f3a",
 };
 let aiStatus: AiStatus = NO_AI
   ? { configured: !FORCE_ONBOARD && !NO_AI, verified: false, model: "", provider: "", lastError: FORCE_ONBOARD ? null : "API Key 已失效（HTTP 401）" }
-  : { configured: true, verified: true, model: "deepseek-chat", provider: "deepseek", verifiedAt: iso(Date.now() - 3600_000), latencyMs: 842, sample: "你好，我已准备好帮你找货比价。" };
-if (NO_AI && !FORCE_ONBOARD) aiStatus = { ...aiStatus, configured: true, model: "deepseek-chat", provider: "deepseek" };
+  : { configured: true, verified: true, model: params.has("oldmodel") ? "deepseek-chat" : "deepseek-flash", provider: "deepseek", verifiedAt: iso(Date.now() - 3600_000), latencyMs: 842, sample: "你好，我已准备好帮你找货比价。" };
+if (NO_AI && !FORCE_ONBOARD) aiStatus = { ...aiStatus, configured: true, model: "deepseek-flash", provider: "deepseek" };
 
 const platforms: PlatformInfo[] = makePlatforms();
 const logins: LoginState[] = makeLogins(platforms);
@@ -136,6 +138,14 @@ function mockPlan(instruction: string): SearchPlan {
   if (wantIntl && !wantCn) ids = ids.filter((id) => P(id)?.region === "intl");
   else if (wantCn && !wantIntl) ids = ids.filter((id) => P(id)?.region === "cn");
   ids = ids.slice(0, 7);
+  // v26.03：指令里点名的平台 = 指定平台（只搜这些，且需要先登录）
+  const de = /德国|德亚|\.de\b/i.test(text);
+  const NAMED: [RegExp, string][] = [
+    [/京东/, "jd"], [/淘宝|天猫/, "taobao"], [/拼多多/, "pinduoduo"], [/闲鱼/, "xianyu"], [/小红书/, "xiaohongshu"], [/抖音/, "douyin"],
+    [/1688/, "alibaba1688"], [/亚马逊|amazon/i, de ? "amazon_de" : "amazon_com"], [/ebay/i, "ebay_de"], [/idealo/i, "idealo"], [/temu/i, "temu"],
+  ];
+  const named = NAMED.filter(([re]) => re.test(text)).map(([, id]) => id).filter((id) => P(id));
+  if (named.length) ids = [...new Set(named)];
   const exclude = /不要二手|排除二手|全新/.test(text) ? ["二手", "翻新", "gebraucht", "refurbished"] : [];
   const brand = /sony|索尼/i.test(kw) ? "Sony" : /apple|苹果|iphone|airpods/i.test(kw) ? "Apple" : /dyson|戴森/i.test(kw) ? "Dyson" : /switch|任天堂/i.test(kw) ? "Nintendo" : null;
   return {
@@ -149,6 +159,7 @@ function mockPlan(instruction: string): SearchPlan {
     currency,
     condition: exclude.length ? "new" : "any",
     platforms: ids,
+    platformsExplicit: named.length > 0,
     queries: ids.map((id) => {
       const p = P(id)!;
       const de = p.locale.startsWith("de");
@@ -215,14 +226,16 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
     const p = P(pid)!;
     const n = 2 + Math.floor(r() * 3);
     for (let k = 0; k < n; k++) {
-      const v = VARIANTS[(k * 3 + pi + Math.floor(r() * 3)) % VARIANTS.length]!;
+      // v26.03 演示：淘宝 / 拼多多最后一条是"原单 / 同款"仿品（价格异常低）
+      const fake = (pid === "taobao" || pid === "pinduoduo") && k === n - 1;
+      const v = fake ? VARIANTS[3]! : VARIANTS[(k * 3 + pi + Math.floor(r() * 3)) % VARIANTS.length]!;
       const regional = p.region === "cn" ? 0.92 + r() * 0.12 : 1.05 + r() * 0.2;
-      const priceCny = baseCny * v.mult * regional;
+      const priceCny = baseCny * v.mult * regional * (fake ? 0.38 : 1);
       const price = round(fxConvert(priceCny, "CNY", p.currency), p.currency);
       const id = `${pid}:${(seed + pi * 31 + k * 7).toString(36)}`;
       const de = p.locale.startsWith("de");
       const en = p.region === "intl" && !de;
-      const title = p.region === "cn" ? `${kw}${v.suffix}` : de ? `${kw}${v.suffixDe}` : en ? `${kw} ${v.verdict === "mismatch" ? "Case / Ear Pads Accessory" : v.cond === "used" ? "Used - Very Good" : "Wireless, Black"}` : `${kw}${v.suffix}`;
+      const title = fake ? `${kw} 原单 高品质 同款 现货速发` : p.region === "cn" ? `${kw}${v.suffix}` : de ? `${kw}${v.suffixDe}` : en ? `${kw} ${v.verdict === "mismatch" ? "Case / Ear Pads Accessory" : v.cond === "used" ? "Used - Very Good" : "Wireless, Black"}` : `${kw}${v.suffix}`;
       const hist = walk(hash(id), price, 60, p.currency, 24);
       const landed = mockLanded(price, p.currency, p.region === "cn", k, r);
       const item: ResultItem = {
@@ -238,6 +251,9 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
         ...landed, deal: mockDeal(hist, landed.couponPrice ?? price, p.currency), provisional: false, feedback: feedbackMap.get(id) ?? null,
       };
       if (item.feedback === "irrelevant") item.match = { ...item.match, verdict: "mismatch", reasons: ["你之前标记为不相关", ...item.match.reasons] };
+      // v26.03 店铺（仿品固定为个人卖家）
+      item.shopInfo = mockShop(pid, fake ? 2 : k, plan.product.brand ?? null, r);
+      item.shop = item.shopInfo.name ?? item.shop;
       listings.set(id, { item, history: hist });
       out.push(item);
     }
@@ -249,12 +265,48 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
   }
   const order: Record<Verdict, number> = { exact: 0, close: 1, related: 2, mismatch: 3 };
   out.sort((a, b) => order[a.match.verdict] - order[b.match.verdict] || (plan.sort === "price_asc" ? (a.displayLanded ?? a.displayPrice ?? 0) - (b.displayLanded ?? b.displayPrice ?? 0) : b.match.score - a.match.score));
+  // v26.03：风险 → 评论（排名靠前的 N 件）→ 标签 → 综合分，按综合分重排
+  const good = out.filter((x) => x.match.verdict === "exact" || x.match.verdict === "close").map((x) => x.displayLanded ?? x.displayPrice ?? 0).filter((x) => x > 0).sort((a, b) => a - b);
+  const median = good.length ? good[Math.floor(good.length / 2)]! : null;
+  for (const x of out) x.risk = mockRisk(x, x.shopInfo!, median);
+  const depth = settings.search.depth;
+  const topN = depth === "quick" ? 0 : depth === "deep" ? Math.max(12, settings.search.reviewTop) : settings.search.reviewTop;
+  out.filter((x) => x.match.verdict !== "mismatch").slice(0, topN).forEach((x) => (x.reviewInsight = mockReviews(x, x.shopInfo!, r, false)));
+  for (const x of out) {
+    x.tags = mockTags(x, x.shopInfo!, x.risk ?? null, x.reviewInsight ?? null);
+    x.finalScore = x.match.verdict === "mismatch" ? null : mockFinal(x);
+  }
+  out.sort((a, b) => order[a.match.verdict] - order[b.match.verdict] || (b.finalScore ?? 0) - (a.finalScore ?? 0));
   out.forEach((x, i) => (x.rank = i + 1));
   return out;
 }
 
+/** v26.03 分阶段推送：只保留到 upto 阶段为止已经得出的信息 */
+type EnrichStage = "screen" | "risk" | "shop" | "reviews" | "review_ai" | "final";
+function staged(full: ResultItem[], upto: EnrichStage): ResultItem[] {
+  const rank: Record<EnrichStage, number> = { screen: 0, risk: 1, shop: 2, reviews: 3, review_ai: 4, final: 5 };
+  const n = rank[upto];
+  const list = full.map((x): ResultItem => ({
+    ...x,
+    risk: n >= 1 ? x.risk : null,
+    shopInfo: n >= 2 ? x.shopInfo : null,
+    shop: x.shop,
+    tags: n >= 2 ? (x.tags ?? []).filter((t) => t.kind !== "well_reviewed" || n >= 4) : [],
+    // 评论检索阶段只有原始数据（评分 / 条数 / 原文），AI 分析后才有优缺点、风险信号与评论分
+    reviewInsight: n >= 4 ? x.reviewInsight : n === 3 && x.reviewInsight ? { ...x.reviewInsight, pros: [], cons: [], redFlags: [], matchNote: null, score: null, aiChecked: false } : null,
+    finalScore: n >= 5 ? x.finalScore : null,
+  }));
+  // 细筛之前按匹配度排序，细筛后用综合分排名
+  if (n < 5) {
+    const order: Record<Verdict, number> = { exact: 0, close: 1, related: 2, mismatch: 3 };
+    list.sort((a, b) => order[a.match.verdict] - order[b.match.verdict] || b.match.score - a.match.score);
+    list.forEach((x, i) => (x.rank = i + 1));
+  }
+  return list;
+}
+
 function makeSummary(plan: SearchPlan, results: ResultItem[]): AiSummary {
-  const good = results.filter((x) => x.match.verdict === "exact" || x.match.verdict === "close");
+  const good = results.filter((x) => (x.match.verdict === "exact" || x.match.verdict === "close") && x.risk?.level !== "high");
   const sorted = [...good].sort((a, b) => (a.displayPrice ?? 1e12) - (b.displayPrice ?? 1e12));
   const best = sorted[0];
   const max = sorted[sorted.length - 1];
@@ -295,66 +347,115 @@ function startRun(instruction: string, plan: SearchPlan | null, trigger: "manual
   };
   const at = (ms: number, fn: () => void) => run.timers.push(window.setTimeout(fn, ms));
   const pids = finalPlan.platforms;
-  const blocked = pids.filter((id) => {
+  const needLogin = (id: string) => {
     const st = logins.find((l) => l.platformId === id);
-    return P(id)?.login === "required" && (st?.status === "logged_out" || st?.status === "expired");
-  });
+    return P(id)?.login === "required" && st?.status !== "logged_in";
+  };
+  // v26.03 平台判定：AI 选择的平台里需要登录但没登录的直接跳过并说明（指定平台在 search_start 已被拦截）
+  const blocked = pids.filter(needLogin);
   const ok = pids.filter((id) => !blocked.includes(id));
+  const skipped = blocked.map((id) => ({ platformId: id, reason: "login_required", message: `${P(id)?.name} 未登录或登录已过期，本次跳过；登录后可重新搜索` }));
+  if (!finalPlan.platformsExplicit && !pids.includes("xiaohongshu") && P("xiaohongshu")?.enabled && needLogin("xiaohongshu")) {
+    skipped.push({ platformId: "xiaohongshu", reason: "login_required", message: "适合看真实口碑，但小红书未登录，本次跳过" });
+  }
+  const disabledSkip = platforms.filter((p) => !p.enabled && p.region === "cn" && p.kind === "c2c").slice(0, 1).map((p) => ({ platformId: p.id, reason: "disabled", message: "在平台目录中未启用" }));
   const stats: PlatformStat[] = [];
   const t0 = Date.now();
   const results = makeResults(runId, finalPlan, ok);
+  const depth = settings.search.depth;
+  const reviewed = results.filter((x) => x.reviewInsight).length;
+  const reviewedOk = results.filter((x) => x.reviewInsight && x.reviewInsight.source !== "none").length;
 
-  at(60, () => push({ type: "stage", stage: "plan", label: "理解指令", progress: 0.05 }));
+  at(60, () => push({ type: "stage", stage: "plan", label: "AI 理解需求", progress: 0.04 }));
   at(520, () => push({ type: "plan", plan: finalPlan }));
-  at(760, () => push({ type: "stage", stage: "search", label: "多平台并行搜索", progress: 0.12 }));
-  pids.forEach((id, i) => at(820 + i * 90, () => push({ type: "platform", platformId: id, state: "queued" })));
-  pids.forEach((id, i) => at(1100 + i * 260, () => push({ type: "platform", platformId: id, state: "searching", message: "打开搜索页…" })));
-  let lastDone = 1100;
+  at(700, () => push({ type: "stage", stage: "platforms", label: "平台判定", progress: 0.08 }));
+  at(980, () =>
+    push({
+      type: "platform_plan",
+      chosen: ok,
+      skipped: [...skipped, ...disabledSkip],
+      reason: finalPlan.platformsExplicit ? "按你指定的平台搜索" : `按「${finalPlan.product.category || "综合"}」品类与地区选择 ${ok.length} 个平台：综合电商比价 + 二手参考`,
+    }),
+  );
+  at(1150, () => push({ type: "stage", stage: "search", label: "多平台并行搜索", progress: 0.12 }));
+  ok.forEach((id, i) => at(1200 + i * 90, () => push({ type: "platform", platformId: id, state: "queued" })));
+  ok.forEach((id, i) => at(1400 + i * 260, () => push({ type: "platform", platformId: id, state: "searching", message: "打开搜索页…" })));
+  let lastDone = 1400;
   let fetched = 0;
-  pids.forEach((id, i) => {
-    const doneAt = 2100 + i * 420 + (hash(id) % 600);
+  ok.forEach((id, i) => {
+    const doneAt = 2300 + i * 420 + (hash(id) % 600);
     lastDone = Math.max(lastDone, doneAt);
-    if (blocked.includes(id)) {
-      at(doneAt - 300, () => {
-        push({ type: "platform", platformId: id, state: "login_required", message: `${P(id)?.name} 需要登录（只需一次）`, ms: doneAt - 1100 });
-        stats.push({ platformId: id, state: "login_required", count: 0, ms: doneAt - 1100, message: "需要登录" });
+    const count = 14 + (hash(id + runId) % 24);
+    fetched += count;
+    if (i === 1) at(doneAt - 900, () => push({ type: "platform", platformId: id, state: "searching", message: "滚动加载第 2 屏…" }));
+    at(doneAt, () => {
+      push({ type: "platform", platformId: id, state: "done", count, ms: doneAt - 1400 - i * 260 });
+      const prov = staged(results, "screen").filter((x) => x.platformId === id).map((x): ResultItem => {
+        const rule = Math.max(20, Math.min(95, x.match.score + ((hash(x.id) % 15) - 7)));
+        return { ...x, id: `p:${x.platformId}:${x.externalId}`, provisional: true, deal: null, alsoOn: [], clusterId: null,
+          match: { score: rule, verdict: rule >= 85 ? "exact" : rule >= 65 ? "close" : rule >= 35 ? "related" : "mismatch", reasons: ["标题包含关键词（规则初判）"], flags: x.match.flags, aiChecked: false } };
       });
-    } else {
-      const count = 14 + (hash(id + runId) % 24);
-      fetched += count;
-      if (i === 1) at(doneAt - 900, () => push({ type: "platform", platformId: id, state: "searching", message: "滚动加载第 2 屏…" }));
-      at(doneAt, () => {
-        push({ type: "platform", platformId: id, state: "done", count, ms: doneAt - 1100 - i * 260 });
-        const prov = results.filter((x) => x.platformId === id).map((x): ResultItem => {
-          const rule = Math.max(20, Math.min(95, x.match.score + ((hash(x.id) % 15) - 7)));
-          return { ...x, id: `p:${x.platformId}:${x.externalId}`, provisional: true, deal: null, alsoOn: [], clusterId: null,
-            match: { score: rule, verdict: rule >= 85 ? "exact" : rule >= 65 ? "close" : rule >= 35 ? "related" : "mismatch", reasons: ["标题包含关键词（规则初判）"], flags: x.match.flags, aiChecked: false } };
-        });
-        if (prov.length) push({ type: "partial", platformId: id, items: prov });
-        stats.push({ platformId: id, state: "done", count, ms: doneAt - 1100, message: null });
-      });
-    }
+      if (prov.length) push({ type: "partial", platformId: id, items: prov });
+      stats.push({ platformId: id, state: "done", count, ms: doneAt - 1400, message: null });
+    });
   });
-  const T = lastDone + 250;
+  for (const sk of skipped) stats.push({ platformId: sk.platformId, state: "login_required", count: 0, ms: 0, message: "需要登录" });
+
   const visible = results.filter((x) => x.match.verdict !== "mismatch");
   const hidden = results.length - visible.length;
-  at(T, () => push({ type: "stage", stage: "extract", label: "抽取商品信息", progress: 0.55 }));
-  at(T + 420, () => push({ type: "filter", fetched, kept: results.length + 3, dropped: { exclude: 4, price: 6, duplicate: 3 }, duplicates: 3 }));
-  at(T + 650, () => push({ type: "stage", stage: "verify", label: "AI 校验匹配度", progress: 0.68 }));
-  at(T + 1500, () => push({ type: "verify", checked: results.length, matched: visible.length, hidden }));
-  at(T + 1650, () => push({ type: "stage", stage: "rank", label: "同款聚合与排序", progress: 0.82 }));
-  at(T + 1950, () => {
-    run.results = results;
-    push({ type: "results", items: results });
+  const highRisk = visible.filter((x) => x.risk?.level === "high").length;
+  let T = lastDone + 300;
+  at(T, () => push({ type: "stage", stage: "screen", label: "粗筛：AI 核对需求匹配度", progress: 0.5 }));
+  at(T + 300, () => push({ type: "filter", fetched, kept: results.length + 3, dropped: { exclude: 4, price: 6, duplicate: 3 }, duplicates: 3 }));
+  at(T + 1100, () => {
+    push({ type: "verify", checked: results.length, matched: visible.length, hidden });
+    push({ type: "results", items: staged(results, "screen") });
+    push({ type: "funnel", stage: "screen", label: "粗筛", input: fetched, kept: visible.length, note: `去重 3 条、不符合预算 / 排除词 10 条，AI 折叠不相关 ${hidden} 条` });
   });
-  at(T + 2100, () => push({ type: "stage", stage: "summarize", label: "AI 总结", progress: 0.92 }));
-  at(T + 2900, () => {
+  T += 1300;
+  at(T, () => push({ type: "stage", stage: "risk", label: "商品风险分析（正品 / 功能 / 二手 / 价格）", progress: 0.6 }));
+  at(T + 1000, () => {
+    push({ type: "results", items: staged(results, "risk") });
+    push({ type: "funnel", stage: "risk", label: "风险", input: visible.length, kept: visible.length - highRisk, note: `${highRisk} 条高风险（疑似仿品或价格异常）` });
+  });
+  T += 1200;
+  at(T, () => push({ type: "stage", stage: "shop", label: "店铺可信度匹配", progress: 0.68 }));
+  at(T + 800, () => push({ type: "results", items: staged(results, "shop") }));
+  T += 1000;
+  if (depth !== "quick" && reviewed) {
+    at(T, () => push({ type: "stage", stage: "reviews", label: `评论检索：读取前 ${reviewed} 件商品的评论与店铺评价`, progress: 0.74 }));
+    // 一件一件读：每读完一件推送一次
+    const order = results.filter((x) => x.reviewInsight);
+    order.forEach((_, i) =>
+      at(T + 700 + i * 450, () => {
+        const done = new Set(order.slice(0, i + 1).map((x) => x.id));
+        const list = staged(results, "reviews").map((x) => (done.has(x.id) ? x : { ...x, reviewInsight: null }));
+        push({ type: "results", items: list });
+      }),
+    );
+    T += 900 + order.length * 450;
+    at(T - 100, () =>
+      push({ type: "funnel", stage: "reviews", label: "评论", input: reviewed, kept: reviewedOk, note: reviewed > reviewedOk ? `${reviewed - reviewedOk} 件需要登录才能看评论` : "全部读取成功" }),
+    );
+    at(T, () => push({ type: "stage", stage: "review_ai", label: "AI 分析评论与需求的匹配", progress: 0.84 }));
+    at(T + 1200, () => push({ type: "results", items: staged(results, "review_ai") }));
+    T += 1400;
+  }
+  at(T, () => push({ type: "stage", stage: "final", label: "最终细筛：综合匹配、风险、店铺、评论与价格", progress: 0.9 }));
+  at(T + 700, () => {
+    run.results = results;
+    push({ type: "results", items: staged(results, "final") });
+    push({ type: "funnel", stage: "final", label: "最终", input: visible.length, kept: settings.search.hideHighRisk ? visible.length - highRisk : visible.length, note: settings.search.hideHighRisk && highRisk ? `${highRisk} 条高风险已折叠` : null });
+  });
+  T += 900;
+  at(T, () => push({ type: "stage", stage: "summarize", label: "AI 总结与推荐", progress: 0.95 }));
+  at(T + 800, () => {
     run.aiSummary = makeSummary(finalPlan, results);
     push({ type: "summary", summary: run.aiSummary });
   });
-  at(T + 3100, () => {
-    const best = visible.filter((x) => x.match.verdict === "exact").sort((a, b) => (a.displayPrice ?? 0) - (b.displayPrice ?? 0))[0];
-    run.stats = { fetched, kept: visible.length, hidden, duplicates: 3, dropped: { exclude: 4, price: 6 }, elapsedMs: Date.now() - t0, platforms: stats, aiCalls: 4 };
+  at(T + 1000, () => {
+    const best = visible.filter((x) => x.match.verdict === "exact" && x.risk?.level !== "high").sort((a, b) => (a.displayPrice ?? 0) - (b.displayPrice ?? 0))[0];
+    run.stats = { fetched, kept: visible.length, hidden, duplicates: 3, dropped: { exclude: 4, price: 6 }, elapsedMs: Date.now() - t0, platforms: stats, aiCalls: depth === "quick" ? 4 : 6 };
     push({ type: "stage", stage: "done", label: "完成", progress: 1 });
     push({ type: "done", stats: run.stats });
     Object.assign(run.summary, { status: "done", finishedAt: iso(), fetched, kept: visible.length, bestPrice: best?.displayPrice ?? null });
@@ -387,7 +488,9 @@ function seedHistory() {
     const plan = mockPlan(ins);
     const runId = uid();
     const ok = plan.platforms.filter((_, i) => i !== 1);
-    const results = status === "done" ? makeResults(runId, plan, ok) : [];
+    let results = status === "done" ? makeResults(runId, plan, ok) : [];
+    // 98 小时前那条模拟 v26.02 的旧记录：没有标签 / 风险 / 店铺 / 评论 / 综合分
+    if (hoursAgo === 98) results = results.map((x) => ({ ...x, tags: undefined, shopInfo: undefined, risk: undefined, reviewInsight: undefined, finalScore: undefined }));
     const vis = results.filter((x) => x.match.verdict !== "mismatch");
     const t = Date.now() - hoursAgo * 3600_000;
     runs.set(runId, {
@@ -466,12 +569,77 @@ function seedMonitors() {
 /* ================================================================ Copilot */
 const copilotSessions = new Map<string, CopilotMessage[]>();
 
+/** 搜索完成后的自动点评（mock）：按综合分 / 到手价挑推荐，并点出风险 */
+function followupReply(ctx: unknown): { content: string; actions: CopilotAction[] } {
+  type C = { id: string; title: string; platform: string; shop?: string | null; landed?: number | null; currency: string; verdict: string; risk?: { level: string; why?: string } | null; reviews?: { score?: number | null } | null; finalScore?: number | null };
+  const items = ((ctx as { results?: C[] })?.results ?? []).filter((x) => x.verdict === "exact" || x.verdict === "close");
+  if (!items.length) return { content: "这次没有找到和需求完全一致的商品，可以放宽预算或换个关键词再试。", actions: [] };
+  const safe = items.filter((x) => x.risk?.level !== "high");
+  const pick = [...(safe.length ? safe : items)].sort((a, b) => (b.finalScore ?? 0) - (a.finalScore ?? 0) || (a.landed ?? 1e12) - (b.landed ?? 1e12))[0]!;
+  const cheapest = [...items].sort((a, b) => (a.landed ?? 1e12) - (b.landed ?? 1e12))[0]!;
+  const cur = settings.displayCurrency;
+  const money = (v?: number | null) => (v == null ? "—" : new Intl.NumberFormat("zh-CN", { style: "currency", currency: cur, maximumFractionDigits: 0 }).format(v));
+  const risky = items.filter((x) => x.risk?.level === "high").slice(0, 2);
+  const lines = [
+    `**推荐：${pick.title.slice(0, 28)}**（${pick.platform}${pick.shop ? " · " + pick.shop : ""}，到手 ${money(pick.landed)}）——匹配度高、店铺可信${pick.reviews?.score ? `，评论分 ${pick.reviews.score}` : ""}。`,
+    cheapest.id !== pick.id ? `- 最便宜的是 ${cheapest.platform} 的 ${money(cheapest.landed)}，${cheapest.risk?.level === "high" ? "但风险偏高，不建议" : "可以作为备选"}。` : "- 它同时也是到手价最低的一款。",
+    ...risky.map((x) => `- ⚠️ ${x.platform}「${x.title.slice(0, 16)}…」风险高：${x.risk?.why || "价格异常或店铺可信度低"}。`),
+    "- 不急的话可以追踪推荐款，降到目标价再买。",
+  ];
+  return { content: lines.join("\n"), actions: [{ type: "watch", label: "追踪推荐款", listingId: pick.id, targetPrice: null, auto: false }] };
+}
+
+/** 用户明确要求 App 去执行时才产生 auto 动作（与 Rust copilot_prompts::wants_app_action 一致的简化版） */
+function wantsAppAction(text: string): boolean {
+  const t = text.toLowerCase().replace(/\s/g, "");
+  return /用app|用软件|在app|app里|帮我搜|帮我查|去搜|搜一下|搜搜|查一下|去(京东|淘宝|拼多多|闲鱼|亚马逊|amazon|ebay)|帮我追踪|加入追踪|帮我盯|盯一下|每天帮我|每周帮我|定时|帮我监控|打开|切换|改成|导出|复制清单|帮我登录|去登录|取消搜索|按到手价排序/.test(t) || /^(搜|search)/.test(t);
+}
+const PLATFORM_WORDS: [RegExp, string][] = [[/京东/, "jd"], [/淘宝|天猫/, "taobao"], [/拼多多/, "pinduoduo"], [/闲鱼/, "xianyu"], [/亚马逊德国|amazon\.?de/i, "amazon_de"], [/ebay/i, "ebay_de"]];
+
+/** App 操控类指令（mock）：搜索 / 追踪页 / 深色 / 导出 / 监控 / 登录 */
+function appControlReply(text: string): { content: string; actions: CopilotAction[] } | null {
+  if (!wantsAppAction(text)) return null;
+  const t = text.replace(/^(请)?(帮我)?(用\s*app|用软件|在\s*app\s*里)?/i, "");
+  if (/深色|暗色|dark/i.test(text)) return { content: "好的，已为你切换到深色模式。", actions: [{ type: "setting", label: "切换深色", key: "theme", value: "dark", auto: true }] };
+  if (/浅色|亮色|light/i.test(text)) return { content: "好的，已切换到浅色模式。", actions: [{ type: "setting", label: "切换浅色", key: "theme", value: "light", auto: true }] };
+  if (/导出/.test(text)) return { content: "好的，正在把当前搜索结果导出为 CSV。", actions: [{ type: "results", label: "导出 CSV", op: "export_csv", auto: true }] };
+  if (/复制清单/.test(text)) return { content: "好的，比价清单复制好了，可以直接粘贴给朋友。", actions: [{ type: "results", label: "复制比价清单", op: "copy_list", auto: true }] };
+  if (/打开.*追踪/.test(text)) return { content: "已为你打开价格追踪页。", actions: [{ type: "navigate", label: "打开价格追踪", route: "/track/watchlist", auto: true }] };
+  if (/登录/.test(text)) {
+    const id = PLATFORM_WORDS.find(([re]) => re.test(text))?.[1] ?? "taobao";
+    return { content: `好的，已打开 ${id === "jd" ? "京东" : id === "taobao" ? "淘宝" : id} 的登录窗口，请在窗口里完成登录（账号密码和验证码只由你本人输入）。`, actions: [{ type: "login", label: "打开登录窗口", platformId: id, auto: true }] };
+  }
+  if (/每天|每周|定时|监控|盯/.test(text)) {
+    const what = t.replace(/每天|每周|帮我|盯一下|盯|监控一下|监控|定时|的价格|价格/g, "").trim() || "Switch 2 马力欧套装";
+    return { content: `好的，我已经创建了「${what}」的定时监控（每 ${/每周/.test(text) ? "7 天" : "天"}一次），降价或出现新低会提醒你。`, actions: [{ type: "monitor", label: `监控：${what}`, instruction: what, intervalMinutes: /每周/.test(text) ? 10080 : 1440, targetPrice: null, auto: true }] };
+  }
+  const platforms = PLATFORM_WORDS.filter(([re]) => re.test(text)).map(([, id]) => id).filter((id) => P(id));
+  const q = t.replace(/搜索一下|搜一下|搜索|去搜|搜搜|查一下|帮我查|^搜/g, "").replace(/^(在|去)/, "").trim() || text;
+  return {
+    content: `好的，我正在${platforms.length ? platforms.map((id) => P(id)?.name).join("、") : "多个平台"}搜索「${q}」，结果出来后我会帮你点评。`,
+    actions: [{ type: "search", label: `搜索：${q.slice(0, 18)}`, instruction: q, platforms: platforms.length ? platforms : null, auto: true }],
+  };
+}
+
 function copilotReply(text: string, skill?: string): { content: string; actions: CopilotAction[] } {
+  const ctl = appControlReply(text);
+  if (ctl) return ctl;
   const s = skill || (/礼物|送/.test(text) ? "gift" : /文案|标题/.test(text) ? "copy" : /行业|品类|格局/.test(text) ? "industry" : /进货|货源|选品/.test(text) ? "sourcing" : /值得|入手|等等/.test(text) ? "timing" : "compare");
   switch (s) {
     case "gift":
+      if (/茶/.test(text)) {
+        return {
+          content:
+            "送爱喝茶的朋友，**建议送好茶具，不建议直接送茶叶**：爱喝茶的人往往只认自己常喝的那几种茶、产区甚至茶商，不知道他的口味时随手买的茶叶很可能不合心意，反而显得外行。茶具则人人用得上，也更体面。\n\n**500 元内的 4 个稳妥方向**（按到手价算）：\n1. **旅行茶具套装**（¥180–380）：快客杯 / 便携盖碗 + 收纳包，出差露营都能泡，实用度最高。\n2. **白瓷或青瓷盖碗 + 公道杯 + 品茗杯组合**（¥200–450）：不挑茶类，绿茶、乌龙、红茶都适合。\n3. **建盏品茗杯**（¥150–400）：有收藏感，选正规窑口、带证书的店铺。\n4. **随手泡 / 煮茶器**（¥250–499）：控温烧水壶对泡茶体验提升明显。\n\n**避雷**：不送紫砂壶（壶型和泥料讲究多，容易踩坑）；包装避免纯白纯黑；选支持七天无理由的旗舰店，方便对方换货。\n\n> 如果你知道他平时只喝某一种茶（比如武夷岩茶、普洱），告诉我，我再帮你挑对应的好茶。",
+          actions: [
+            { type: "search", label: "搜：旅行茶具套装 500 元内", instruction: "旅行茶具套装 便携 500元以内 礼盒", auto: false },
+            { type: "search", label: "搜：盖碗公道杯套装", instruction: "白瓷盖碗 公道杯 品茗杯 套装 500元以内 礼盒", auto: false },
+            { type: "search", label: "搜：建盏品茗杯", instruction: "建盏 品茗杯 正品 带证书 400元以内", auto: false },
+          ],
+        };
+      }
       return {
-        content: "根据你的描述，我给出 **3 个方向**，都控制在预算内：\n\n1. **轻量露营灯 + 挂钩套装**（¥120–260）：实用、几乎每次露营都会用到，选 USB-C 充电、带红光模式的款。\n2. **钛合金露营杯 / 咖啡套装**（¥180–420）：有仪式感，适合喜欢在营地煮咖啡的人。\n3. **便携户外电源 300Wh 级**（¥450–499 档位较少，注意促销）：给手机、灯、风扇供电，体验升级明显。\n\n> 建议优先看京东自营和天猫旗舰店，送礼开票、售后更省心。",
+        content: "根据你的描述，我给出 **3 个稳妥方向**，都控制在预算内（按到手价）：\n\n1. **轻量露营灯 + 挂钩套装**（¥120–260）：实用、几乎每次露营都会用到，选 USB-C 充电、带红光模式的款。\n2. **钛合金露营杯 / 咖啡器具套装**（¥180–420）：有仪式感；送器具而不是咖啡豆，避免口味不合。\n3. **便携户外电源 300Wh 级**（¥450–499 档位较少，注意促销）：给手机、灯、风扇供电，体验升级明显。\n\n> 送长辈避开钟、伞、鞋；建议优先看京东自营和天猫旗舰店，开票、售后和换货更省心。",
         actions: [
           { type: "search", label: "搜：露营灯 礼盒 500元以内", instruction: "露营灯 礼盒 500元以内 京东 淘宝" },
           { type: "search", label: "搜：钛合金露营咖啡套装", instruction: "钛合金露营咖啡杯套装 500元以内" },
@@ -609,12 +777,13 @@ function clearLoginTimers(id: string) {
   (loginTimers.get(id) ?? []).forEach((t) => clearTimeout(t));
   loginTimers.set(id, []);
 }
+/** v26.03：只更新这一个平台（平台之间不再联动） */
 function loginSuccess(id: string) {
   const p = P(id);
   const now = iso();
-  const group = platforms.filter((o) => o.accountGroup === p?.accountGroup).map((o) => o.id);
-  group.forEach((gid) => setLogin(gid, { status: "logged_in", flow: gid === id ? "success" : "idle", verifiedAt: now, lastWallAt: null, cookieExpires: iso(Date.now() + 30 * 86400_000), message: gid === id ? "已登录并保存会话" : null }));
-  addNotice({ kind: "login", level: "success", title: `${p?.name}${p?.region === "intl" ? " · " + p.edition : ""} 已登录`, body: "登录会话只保存在本机，之后搜索会自动使用。", link: "/platforms/accounts" });
+  setLogin(id, { status: "logged_in", flow: "success", verifiedAt: now, checkedAt: now, vaulted: true, lastWallAt: null, cookieExpires: iso(Date.now() + 30 * 86400_000), message: `${p?.name ?? id} 登录成功，3 秒后自动关闭窗口` });
+  addNotice({ kind: "login", level: "success", title: `${p?.name}${p?.region === "intl" ? " · " + p.edition : ""} 已登录`, body: "登录会话保存在本机（含加密备份），之后搜索会自动使用。", link: "/platforms/accounts" });
+  loginTimers.get(id)?.push(window.setTimeout(() => setLogin(id, { flow: "idle", message: null }), 8000));
 }
 
 function addNotice(n: Omit<Notice, "id" | "read" | "createdAt" | "url"> & { url?: string }) {
@@ -628,7 +797,7 @@ type Handler = (a: Record<string, unknown>) => unknown | Promise<unknown>;
 
 const H: Record<string, Handler> = {
   app_bootstrap: (): Bootstrap => ({
-    version: "26.02", dataDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app", settings: jclone(settings),
+    version: "26.03", dataDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app", settings: jclone(settings),
     ai: { ...aiStatus }, platforms: jclone(platforms), logins: jclone(logins), unread: notices.filter((n) => !n.read).length,
     runningRuns: [...runs.values()].filter((r) => r.summary.status === "running").map((r) => r.summary.id), fx: FX,
   }),
@@ -690,7 +859,7 @@ const H: Record<string, Handler> = {
       accountGroup: id, login: "optional", beta: true, enabled: true, custom: true, note: "自定义平台",
     };
     platforms.push(p);
-    logins.push({ platformId: id, status: "not_needed", flow: "idle", sharedWith: [] });
+    logins.push({ platformId: id, status: "not_needed", flow: "idle", checkedAt: null, vaulted: false });
     return p;
   },
   platform_remove_custom: ({ id }) => {
@@ -704,19 +873,35 @@ const H: Record<string, Handler> = {
   login_start: ({ platformId }) => {
     const id = platformId as string;
     clearLoginTimers(id);
-    const st = setLogin(id, { flow: "opening", message: "正在打开官网登录页…" });
+    const name = P(id)?.name ?? id;
+    const st = setLogin(id, { flow: "opening", message: `正在打开 ${name} 官网…` });
     const ts = loginTimers.get(id)!;
-    ts.push(window.setTimeout(() => setLogin(id, { flow: "waiting", message: "请在弹出的浏览器窗口中登录，完成后会自动识别" }), 700));
-    ts.push(window.setTimeout(() => setLogin(id, { flow: "verifying", message: "检测到登录 Cookie，正在验证…" }), 5200));
-    ts.push(window.setTimeout(() => loginSuccess(id), 6400));
+    ts.push(window.setTimeout(() => setLogin(id, { flow: "waiting", message: `请在弹出的浏览器窗口中登录 ${name}，登录成功后会自动识别（会打开账号页确认），请勿手动关闭窗口` }), 700));
+    ts.push(window.setTimeout(() => setLogin(id, { flow: "waiting", message: "正在登录 / 身份验证中…完成后会自动识别（请勿关闭窗口）" }), 3600));
+    ts.push(window.setTimeout(() => setLogin(id, { flow: "verifying", message: "检测到登录信息，正在确认…（请勿关闭窗口）" }), 6200));
+    ts.push(window.setTimeout(() => setLogin(id, { flow: "verifying", message: "正在打开账号页确认登录…（请勿关闭窗口）" }), 8200));
+    ts.push(window.setTimeout(() => loginSuccess(id), 9600));
     return st;
   },
-  login_confirm: ({ platformId }) => {
+  login_confirm: async ({ platformId }) => {
     const id = platformId as string;
-    clearLoginTimers(id);
-    const st = setLogin(id, { flow: "verifying", message: "正在验证登录状态…" });
-    loginTimers.get(id)!.push(window.setTimeout(() => loginSuccess(id), 1100));
-    return st;
+    const cur = logins.find((l) => l.platformId === id);
+    const name = P(id)?.name ?? id;
+    if (cur && ["opening", "waiting", "verifying"].includes(cur.flow)) {
+      clearLoginTimers(id);
+      const st = setLogin(id, { flow: "verifying", message: "正在打开账号页确认登录…" });
+      loginTimers.get(id)!.push(window.setTimeout(() => loginSuccess(id), 1400));
+      return st;
+    }
+    // 没有登录流程：主动验证一次（打开账号页）
+    await sleep(1100);
+    if (cur?.status === "logged_in") {
+      const st = setLogin(id, { checkedAt: iso(), verifiedAt: iso(), vaulted: true })!;
+      return { ...st, message: `${name} 登录有效（已打开账号页确认）` };
+    }
+    if (cur?.status === "not_needed") return { ...cur, message: `${name} 无需登录即可搜索` };
+    const st = setLogin(id, { status: cur?.status === "expired" ? "expired" : "logged_out", checkedAt: iso() })!;
+    return { ...st, message: `${name} 需要重新登录：账号页跳转到了登录 / 验证页面` };
   },
   login_cancel: ({ platformId }) => {
     const id = platformId as string;
@@ -726,16 +911,15 @@ const H: Record<string, Handler> = {
   logout: ({ platformId }) => {
     const id = platformId as string;
     clearLoginTimers(id);
-    const p = P(id);
-    platforms.filter((o) => o.accountGroup === p?.accountGroup && o.id !== id).forEach((o) => setLogin(o.id, { status: "logged_out", flow: "idle", verifiedAt: null, message: null }));
-    return setLogin(id, { status: "logged_out", flow: "idle", verifiedAt: null, cookieExpires: null, lastWallAt: null, message: "已退出，本机会话已删除" });
+    setLogin(id, { status: "logged_out", flow: "idle", verifiedAt: null, checkedAt: null, vaulted: false, cookieExpires: null, lastWallAt: null, message: null });
+    return { ...logins.find((l) => l.platformId === id)!, message: "已退出，本机会话与备份已删除，其他平台不受影响" };
   },
   browser_info: () => ({ executable: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", running: true, profileDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app\\browser-profile", transport: "pipe" }),
   browser_show: () => undefined,
   browser_wipe: async () => {
     await sleep(600);
     logins.forEach((l) => {
-      if (l.status !== "not_needed") setLogin(l.platformId, { status: "logged_out", flow: "idle", verifiedAt: null, cookieExpires: null, lastWallAt: null, message: null });
+      if (l.status !== "not_needed") setLogin(l.platformId, { status: "logged_out", flow: "idle", verifiedAt: null, checkedAt: null, vaulted: false, cookieExpires: null, lastWallAt: null, message: null });
     });
   },
 
@@ -746,7 +930,13 @@ const H: Record<string, Handler> = {
   search_start: async ({ instruction, plan }) => {
     if (!aiStatus.verified) throw err("AI_REQUIRED", "请先连接并测试 AI 模型");
     await sleep(120);
-    return startRun(String(instruction ?? ""), (plan as SearchPlan | null) ?? null);
+    // v26.03：指定平台（选择器 / 指令点名）里需要登录却没登录的，不能搜索
+    const p = (plan as SearchPlan | null) ?? mockPlan(String(instruction ?? ""));
+    if (p.platformsExplicit) {
+      const need = p.platforms.filter((id) => P(id)?.login === "required" && logins.find((l) => l.platformId === id)?.status !== "logged_in");
+      if (need.length) throw { code: "LOGIN_REQUIRED", message: `请先登录：${need.map((id) => P(id)?.name ?? id).join("、")}（登录后再搜索）`, platforms: need };
+    }
+    return startRun(String(instruction ?? ""), p);
   },
   search_cancel: ({ runId }) => cancelRun(runId as string),
   search_events: ({ runId, since }) => (runs.get(runId as string)?.events ?? []).filter((e) => e.seq > Number(since ?? 0)),
@@ -962,6 +1152,38 @@ const H: Record<string, Handler> = {
     });
   },
 
+  /* ---------------------------------------------------------- v26.03（各分支在此基础上完善） */
+  ai_list_models: async ({ input }) => {
+    await sleep(600);
+    const i = (input as AiConfigInput | null) ?? { provider: aiConfig.provider, baseUrl: aiConfig.baseUrl };
+    const p = PRESETS.find((x) => x.id === i.provider) ?? PRESETS.find((x) => x.baseUrl && i.baseUrl?.startsWith(x.baseUrl));
+    if (!p || !p.models.length) return { models: [], message: "该服务不支持列出模型，可手动填写模型名" };
+    const extra: Record<string, string[]> = { deepseek: [], openai: ["gpt-6-luna"], qwen: ["qwen3.8-max-0902"], gemini: ["gemini-flash-latest"] };
+    return { models: [...p.models, ...(p.fastModel && !p.models.includes(p.fastModel) ? [p.fastModel] : []), ...(extra[p.id] ?? [])].sort(), message: null };
+  },
+  login_preflight: async ({ platformIds, verify }) => {
+    const ids = (platformIds as string[]) ?? [];
+    const stale = (t?: string | null) => !t || Date.now() - new Date(t).getTime() > 20 * 60_000;
+    const todo = verify ? ids.filter((id) => P(id)?.login !== "optional" && logins.find((l) => l.platformId === id)?.status === "logged_in" && stale(logins.find((l) => l.platformId === id)?.checkedAt)) : [];
+    if (todo.length) await sleep(500 + todo.length * 250);
+    todo.forEach((id) => setLogin(id, { checkedAt: iso(), verifiedAt: iso() }));
+    return ids.map((id) => {
+      const p = P(id);
+      const st = logins.find((l) => l.platformId === id);
+      const ok = st?.status === "logged_in" || st?.status === "not_needed" || p?.login === "optional";
+      const message = ok ? null : st?.status === "expired" ? `${p?.name} 的登录已过期，请重新登录` : p?.login === "recommended" ? `建议先登录 ${p?.name}（不登录也能搜，结果可能较少）` : `${p?.name} 需要先登录才能搜索`;
+      return { platformId: id, need: p?.login ?? "optional", status: st?.status ?? "unknown", ok, verifiedNow: todo.includes(id), message };
+    });
+  },
+  login_check_all: async () => {
+    await sleep(1500);
+    platforms.filter((p) => p.enabled && p.login !== "optional").forEach((p) => {
+      const st = logins.find((l) => l.platformId === p.id);
+      if (st?.status === "logged_in") setLogin(p.id, { checkedAt: iso(), verifiedAt: iso(), vaulted: true });
+    });
+    return jclone(logins);
+  },
+
   copilot_skills: () => SKILLS,
   copilot_history: ({ sessionId }) => [...(copilotSessions.get(sessionId as string) ?? [])],
   copilot_send: ({ input }) => {
@@ -969,9 +1191,10 @@ const H: Record<string, Handler> = {
     const i = input as CopilotSendInput;
     const list = copilotSessions.get(i.sessionId) ?? [];
     copilotSessions.set(i.sessionId, list);
-    list.push({ id: uid(), sessionId: i.sessionId, role: "user", content: i.text, actions: [], createdAt: iso() });
+    const followup = i.kind === "run_followup";
+    list.push({ id: uid(), sessionId: i.sessionId, role: followup ? "event" : "user", content: i.text, actions: [], createdAt: iso() });
     const messageId = uid();
-    const { content, actions } = copilotReply(i.text, i.skill);
+    const { content, actions } = followup ? followupReply(i.context) : copilotReply(i.text, i.skill);
     const raw = content + "\n\n```actions\n" + JSON.stringify(actions) + "\n```";
     let k = 0;
     const tick = () => {

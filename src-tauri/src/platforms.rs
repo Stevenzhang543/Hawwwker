@@ -7,7 +7,7 @@ use crate::models::{CustomPlatformInput, PlatformInfo, PlatformPatch};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Platform {
     pub id: String,
@@ -27,6 +27,7 @@ pub struct Platform {
     pub default_search: String,
     /// 详情链接正则（JS 语法），第 1 组为商品 ID；为空则只用卡片兜底识别
     pub link: String,
+    /// v26.03 起每个平台都是独立账号（account_group = 平台 id），平台之间不再联动登录 / 退出。
     pub account_group: String,
     pub login: String,
     pub beta: bool,
@@ -34,8 +35,12 @@ pub struct Platform {
     pub custom: bool,
     pub note: String,
     pub cookie_domains: Vec<String>,
-    /// 只有登录用户才有的 Cookie（游客 Cookie 不列入）
+    /// 只有登录完成后才会出现的"强"Cookie。游客 Cookie、退出后仍保留的"记住昵称"类 Cookie（tracknick / lgc）、
+    /// 游客也有但值不同的 Cookie（1688 `__cn_logon__=false`）都不列入。
     pub auth_cookies: Vec<String>,
+    /// v26.03 账号页：未登录时会跳转到登录页。用于主动验证登录（隐藏标签打开，只读页面）。
+    #[serde(default)]
+    pub probe_url: String,
     /// 页面文字出现即视为登录墙（只在没识别到结果时判断）
     pub wall_text: Vec<String>,
     /// URL 包含即视为登录页
@@ -127,7 +132,8 @@ fn p(
         search: search.into(),
         default_search: search.into(),
         link: link.into(),
-        account_group: group.into(),
+        // v26.03：平台之间不再共享登录，每个平台都是独立账号（保留参数只为兼容注册表写法）
+        account_group: { let _ = group; id.into() },
         login: login.into(),
         beta,
         enabled,
@@ -140,6 +146,7 @@ fn p(
         keepalive: String::new(),
         detail: String::new(),
         sort: vec![],
+        probe_url: String::new(),
     }
 }
 
@@ -149,6 +156,7 @@ trait With {
     fn keep(self, url: &str) -> Self;
     fn detail(self, tpl: &str) -> Self;
     fn sorts(self, s: &[(&str, &str)]) -> Self;
+    fn probe(self, url: &str) -> Self;
 }
 
 impl With for Platform {
@@ -173,6 +181,10 @@ impl With for Platform {
         self.sort = s.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect();
         self
     }
+    fn probe(mut self, url: &str) -> Self {
+        self.probe_url = url.into();
+        self
+    }
 }
 
 const ALI_WALL: &[&str] = &["密码登录", "短信登录", "扫码登录", "亲，请登录", "请登录后"];
@@ -183,14 +195,16 @@ pub static BUILTIN: LazyLock<Vec<Platform>> = LazyLock::new(|| {
         p("taobao", "taobao", "淘宝", "淘宝/天猫", "国内版", "cn", "CN", "marketplace", "CNY", "zh-CN", "#FF5000", "淘",
           "https://www.taobao.com/", "https://s.taobao.com/search?q={q}",
           r"(?:item\.taobao\.com/item\.htm|detail\.tmall\.com/item\.htm|a\.m\.taobao\.com/i)[^\s\x22']*?[?&]id=(\d+)",
-          "alibaba_cn", "required", false, true, "与闲鱼、1688 共用阿里账号")
+          "taobao", "required", false, true, "")
             .cookies(&["taobao.com", "tmall.com"], &["unb", "cookie17"]).wall(ALI_WALL).keep("https://www.taobao.com/")
+            .probe("https://i.taobao.com/my_taobao.htm")
             .detail("https://item.taobao.com/item.htm?id={id}")
             .sorts(&[("sales", "&sort=sale-desc"), ("price_asc", "&sort=price-asc"), ("price_desc", "&sort=price-desc")]),
         p("jd", "jd", "京东", "京东", "国内版", "cn", "CN", "retail", "CNY", "zh-CN", "#E1251B", "京",
           "https://www.jd.com/", "https://search.jd.com/Search?keyword={q}&enc=utf-8", r"item\.jd\.com/(\d+)\.html",
           "jd", "required", false, true, "")
             .cookies(&["jd.com"], &["thor", "pt_key"]).wall(&["欢迎登录", "扫码登录", "账户登录"]).keep("https://www.jd.com/")
+            .probe("https://home.jd.com/")
             .detail("https://item.jd.com/{id}.html")
             .sorts(&[("sales", "&psort=3"), ("price_asc", "&psort=2"), ("price_desc", "&psort=1")]),
         p("pinduoduo", "pinduoduo", "拼多多", "拼多多", "国内版", "cn", "CN", "marketplace", "CNY", "zh-CN", "#E02E24", "拼",
@@ -198,44 +212,50 @@ pub static BUILTIN: LazyLock<Vec<Platform>> = LazyLock::new(|| {
           r"goods\d?\.html\?(?:[^\x22'#]*&)?goods_id=(\d+)", "pinduoduo", "required", false, true, "移动网页版，需手机号登录")
             .cookies(&["yangkeduo.com", "pinduoduo.com"], &["PDDAccessToken", "pdd_user_id"])
             .wall(&["手机登录", "登录查看", "请使用手机号登录"]).keep("https://mobile.yangkeduo.com/")
+            .probe("https://mobile.yangkeduo.com/personal.html")
             .detail("https://mobile.yangkeduo.com/goods.html?goods_id={id}"),
         p("xianyu", "xianyu", "闲鱼", "闲鱼", "国内版", "cn", "CN", "c2c", "CNY", "zh-CN", "#FFB800", "闲",
           "https://www.goofish.com/", "https://www.goofish.com/search?q={q}",
           r"(?:goofish\.com/item\?(?:[^\x22'#]*&)?id=|2\.taobao\.com/item\.htm\?(?:[^\x22'#]*&)?id=)(\d+)",
-          "alibaba_cn", "required", false, true, "二手与转卖；与淘宝共用阿里账号")
-            .cookies(&["goofish.com", "taobao.com"], &["unb", "cookie17"]).wall(ALI_WALL).keep("https://www.goofish.com/")
+          "xianyu", "required", false, true, "二手与转卖；独立登录（不再与淘宝联动）")
+            .cookies(&["goofish.com"], &["unb", "cookie17"]).wall(&["密码登录", "短信登录", "扫码登录", "登录后可以更懂你", "请登录"])
+            .keep("https://www.goofish.com/").probe("https://www.goofish.com/personal")
             .detail("https://www.goofish.com/item?id={id}"),
         p("alibaba1688", "1688", "1688", "1688", "国内版", "cn", "CN", "wholesale", "CNY", "zh-CN", "#FF6A00", "批",
           "https://www.1688.com/", "https://s.1688.com/selloffer/offer_search.htm?keywords={q}&charset=utf8",
-          r"detail\.1688\.com/offer/(\d+)\.html", "alibaba_cn", "required", false, false, "货源与批发价；与淘宝共用阿里账号")
-            .cookies(&["1688.com", "taobao.com"], &["__cn_logon__", "unb"]).wall(ALI_WALL).keep("https://www.1688.com/")
+          r"detail\.1688\.com/offer/(\d+)\.html", "alibaba1688", "required", false, false, "货源与批发价；独立登录")
+            .cookies(&["1688.com"], &["__cn_logon_id__", "unb"]).wall(ALI_WALL).keep("https://www.1688.com/")
+            .probe("https://work.1688.com/")
             .detail("https://detail.1688.com/offer/{id}.html"),
         p("xiaohongshu", "xiaohongshu", "小红书", "小红书", "国内版", "cn", "CN", "social", "CNY", "zh-CN", "#FF2442", "红",
           "https://www.xiaohongshu.com/explore",
           "https://www.xiaohongshu.com/search_result?keyword={q}&source=web_search_result_notes",
           r"xiaohongshu\.com/(?:explore|search_result|discovery/item)/([0-9a-f]{24})", "xiaohongshu", "required", false, true,
-          "种草笔记与口碑；游客也会有会话 Cookie，以搜索结果验证为准")
-            .cookies(&["xiaohongshu.com"], &["web_session"]).wall(&["登录后查看", "手机号登录", "登录探索更多"])
-            .keep("https://www.xiaohongshu.com/explore"),
+          "种草笔记与口碑；游客也有 web_session，以 Cookie 变化 + 主动验证为准")
+            .cookies(&["xiaohongshu.com"], &["web_session"]).wall(&["登录后查看", "手机号登录", "登录探索更多", "登录后推荐更懂你的笔记", "马上登录即可"])
+            .keep("https://www.xiaohongshu.com/explore").probe("https://www.xiaohongshu.com/explore"),
         p("douyin", "douyin", "抖音", "抖音", "国内版", "cn", "CN", "social", "CNY", "zh-CN", "#161823", "抖",
           "https://www.douyin.com/", "https://www.douyin.com/search/{q}?type=general", r"douyin\.com/(?:video|note)/(\d{10,})",
           "douyin", "required", false, true, "")
-            .cookies(&["douyin.com"], &["sessionid", "sessionid_ss"]).wall(&["扫码登录", "验证码登录", "登录后即可"])
-            .keep("https://www.douyin.com/"),
+            .cookies(&["douyin.com"], &["sessionid", "sessionid_ss", "sid_guard", "uid_tt"]).wall(&["扫码登录", "验证码登录", "登录后即可"])
+            .keep("https://www.douyin.com/").probe("https://www.douyin.com/user/self"),
         p("weibo", "weibo", "微博", "微博", "国内版", "cn", "CN", "social", "CNY", "zh-CN", "#E6162D", "博",
           "https://weibo.com/", "https://s.weibo.com/weibo?q={q}", r"weibo\.com/\d+/([A-Za-z0-9]{8,})", "weibo", "required",
           false, false, "公开讨论与求推荐")
-            .cookies(&["weibo.com", "weibo.cn"], &["SUB"]).wall(&["立即登录", "扫码登录", "登录后查看"]).keep("https://weibo.com/"),
+            .cookies(&["weibo.com", "weibo.cn"], &["SSOLoginState", "ALF"]).wall(&["立即登录", "扫码登录", "登录后查看"]).keep("https://weibo.com/")
+            .probe("https://account.weibo.com/set/index"),
         /* ---------------- 国际版（与国内版同家族） ---------------- */
         p("rednote", "xiaohongshu", "小红书", "RedNote", "国际版", "intl", "SG", "social", "USD", "en-US", "#FF2442", "R",
           "https://www.rednote.com/explore", "https://www.rednote.com/search_result?keyword={q}&source=web_search_result_notes",
           r"(?:rednote|xiaohongshu)\.com/(?:explore|search_result|discovery/item)/([0-9a-f]{24})", "rednote", "recommended",
           true, false, "小红书国际版（rednote.com）")
-            .cookies(&["rednote.com"], &["web_session"]).keep("https://www.rednote.com/explore"),
+            .cookies(&["rednote.com"], &["web_session"]).wall(&["Log in", "Sign up", "登录"]).keep("https://www.rednote.com/explore")
+            .probe("https://www.rednote.com/explore"),
         p("tiktok", "douyin", "抖音", "TikTok", "国际版", "intl", "US", "social", "USD", "en-US", "#000000", "T",
           "https://www.tiktok.com/", "https://www.tiktok.com/search?q={q}", r"tiktok\.com/@[^/\x22']+/video/(\d{10,})",
           "tiktok", "recommended", true, false, "抖音国际版")
-            .cookies(&["tiktok.com"], &["sessionid", "sid_tt"]).keep("https://www.tiktok.com/"),
+            .cookies(&["tiktok.com"], &["sessionid", "sid_tt", "sid_guard"]).keep("https://www.tiktok.com/")
+            .probe("https://www.tiktok.com/setting"),
         p("temu", "pinduoduo", "拼多多", "Temu", "国际版", "intl", "US", "marketplace", "USD", "en-US", "#FB7701", "T",
           "https://www.temu.com/", "https://www.temu.com/search_result.html?search_key={q}",
           r"temu\.com/[^\x22'?#]*?-g-(\d{6,})\.html", "temu", "optional", true, true, "拼多多国际版；币种以页面显示为准")
@@ -257,29 +277,29 @@ pub static BUILTIN: LazyLock<Vec<Platform>> = LazyLock::new(|| {
         p("amazon_com", "amazon", "Amazon", "Amazon", "美国站", "intl", "US", "retail", "USD", "en-US", "#FF9900", "a",
           "https://www.amazon.com/", "https://www.amazon.com/s?k={q+}",
           r"amazon\.com/(?:[^\x22'?#]*/)?(?:dp|gp/product)/([A-Z0-9]{10})", "amazon_com", "optional", false, true, "")
-            .cookies(&["amazon.com"], &["at-main", "x-main"]).keep("https://www.amazon.com/")
+            .cookies(&["amazon.com"], &["at-main", "sess-at-main"]).probe("https://www.amazon.com/gp/css/homepage.html").keep("https://www.amazon.com/")
             .detail("https://www.amazon.com/dp/{id}")
             .sorts(&[("price_asc", "&s=price-asc-rank"), ("price_desc", "&s=price-desc-rank"), ("rating", "&s=review-rank"), ("recent", "&s=date-desc-rank")]),
         p("amazon_de", "amazon", "Amazon", "Amazon", "德国站", "intl", "DE", "retail", "EUR", "de-DE", "#FF9900", "a",
           "https://www.amazon.de/", "https://www.amazon.de/s?k={q+}",
           r"amazon\.de/(?:[^\x22'?#]*/)?(?:dp|gp/product)/([A-Z0-9]{10})", "amazon_de", "optional", false, true, "")
-            .cookies(&["amazon.de"], &["at-acbde", "x-acbde"]).keep("https://www.amazon.de/")
+            .cookies(&["amazon.de"], &["at-acbde", "sess-at-acbde"]).probe("https://www.amazon.de/gp/css/homepage.html").keep("https://www.amazon.de/")
             .detail("https://www.amazon.de/dp/{id}")
             .sorts(&[("price_asc", "&s=price-asc-rank"), ("price_desc", "&s=price-desc-rank"), ("rating", "&s=review-rank"), ("recent", "&s=date-desc-rank")]),
         p("amazon_co_uk", "amazon", "Amazon", "Amazon", "英国站", "intl", "GB", "retail", "GBP", "en-GB", "#FF9900", "a",
           "https://www.amazon.co.uk/", "https://www.amazon.co.uk/s?k={q+}",
           r"amazon\.co\.uk/(?:[^\x22'?#]*/)?(?:dp|gp/product)/([A-Z0-9]{10})", "amazon_co_uk", "optional", false, false, "")
-            .cookies(&["amazon.co.uk"], &["at-acbuk", "x-acbuk"]).detail("https://www.amazon.co.uk/dp/{id}")
+            .cookies(&["amazon.co.uk"], &["at-acbuk", "sess-at-acbuk"]).probe("https://www.amazon.co.uk/gp/css/homepage.html").detail("https://www.amazon.co.uk/dp/{id}")
             .sorts(&[("price_asc", "&s=price-asc-rank"), ("price_desc", "&s=price-desc-rank")]),
         p("amazon_co_jp", "amazon", "Amazon", "Amazon", "日本站", "intl", "JP", "retail", "JPY", "ja-JP", "#FF9900", "a",
           "https://www.amazon.co.jp/", "https://www.amazon.co.jp/s?k={q+}",
           r"amazon\.co\.jp/(?:[^\x22'?#]*/)?(?:dp|gp/product)/([A-Z0-9]{10})", "amazon_co_jp", "optional", false, false, "")
-            .cookies(&["amazon.co.jp"], &["at-acbjp", "x-acbjp"]).detail("https://www.amazon.co.jp/dp/{id}")
+            .cookies(&["amazon.co.jp"], &["at-acbjp", "sess-at-acbjp"]).probe("https://www.amazon.co.jp/gp/css/homepage.html").detail("https://www.amazon.co.jp/dp/{id}")
             .sorts(&[("price_asc", "&s=price-asc-rank"), ("price_desc", "&s=price-desc-rank")]),
         p("amazon_fr", "amazon", "Amazon", "Amazon", "法国站", "intl", "FR", "retail", "EUR", "fr-FR", "#FF9900", "a",
           "https://www.amazon.fr/", "https://www.amazon.fr/s?k={q+}",
           r"amazon\.fr/(?:[^\x22'?#]*/)?(?:dp|gp/product)/([A-Z0-9]{10})", "amazon_fr", "optional", false, false, "")
-            .cookies(&["amazon.fr"], &["at-acbfr", "x-acbfr"]).detail("https://www.amazon.fr/dp/{id}")
+            .cookies(&["amazon.fr"], &["at-acbfr", "sess-at-acbfr"]).probe("https://www.amazon.fr/gp/css/homepage.html").detail("https://www.amazon.fr/dp/{id}")
             .sorts(&[("price_asc", "&s=price-asc-rank"), ("price_desc", "&s=price-desc-rank")]),
         p("ebay_com", "ebay", "eBay", "eBay", "美国站", "intl", "US", "marketplace", "USD", "en-US", "#0064D2", "e",
           "https://www.ebay.com/", "https://www.ebay.com/sch/i.html?_nkw={q+}",
@@ -463,11 +483,6 @@ pub fn remove_custom(db: &Db, id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 共享登录的平台（同一 accountGroup）。
-pub fn shared_with(all: &[Platform], p: &Platform) -> Vec<String> {
-    all.iter().filter(|o| o.id != p.id && o.account_group == p.account_group).map(|o| o.id.clone()).collect()
-}
-
 /// 指令中的平台别名（规则预解析用）。
 pub fn aliases() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -502,6 +517,21 @@ mod tests {
             }
             assert!(p.search.contains("{q"), "{} search template", p.id);
         }
+    }
+
+    #[test]
+    fn every_platform_is_its_own_account() {
+        for p in BUILTIN.iter() {
+            assert_eq!(p.account_group, p.id, "{} must not share login with other platforms", p.id);
+            if p.login == "required" {
+                assert!(!p.auth_cookies.is_empty(), "{} needs strong auth cookies", p.id);
+                assert!(!p.probe_url.is_empty(), "{} needs a probe url", p.id);
+            }
+        }
+        // 闲鱼与淘宝不再共用 Cookie 域名
+        let tb = BUILTIN.iter().find(|p| p.id == "taobao").unwrap();
+        let xy = BUILTIN.iter().find(|p| p.id == "xianyu").unwrap();
+        assert!(xy.cookie_domains.iter().all(|d| !tb.cookie_domains.contains(d)));
     }
 
     #[test]

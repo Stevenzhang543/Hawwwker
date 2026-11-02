@@ -23,7 +23,7 @@ pub mod tracker;
 use state::AppState;
 use tauri::Manager;
 
-pub const VERSION: &str = "26.02";
+pub const VERSION: &str = "26.03";
 
 /// 命令行：`hawwwker --selftest-sites <报告.md> [平台id…]`
 /// 用独立的临时浏览器目录对平台做真实小搜索，写出报告后退出（不打开主窗口、不读取你的登录会话）。
@@ -100,12 +100,15 @@ pub fn run() {
             commands::ai_save_config,
             commands::ai_test,
             commands::ai_presets,
+            commands::ai_list_models,
             commands::ai_usage,
             commands::platforms_list,
             commands::platform_update,
             commands::platform_add_custom,
             commands::platform_remove_custom,
             commands::login_states,
+            commands::login_preflight,
+            commands::login_check_all,
             commands::login_start,
             commands::login_confirm,
             commands::login_cancel,
@@ -156,17 +159,22 @@ pub fn run() {
                 let st = app.state::<AppState>().inner().clone();
                 st.runs.cancel_all();
                 tauri::async_runtime::block_on(async move {
-                    let work = async {
+                    // 1) 备份与会话 Cookie 持久化：最多 4 秒（浏览器无响应时不拖住退出）
+                    let backup = async {
                         if st.browser.alive().await {
+                            // v26.03：退出前备份已登录（且没有正在登录）的平台会话
+                            let candidates = st.logins.backup_candidates(&st.db);
+                            let refs: Vec<&platforms::Platform> = candidates.iter().collect();
+                            crate::browser::vault::snapshot(&st.db, &st.browser, &refs).await;
                             let mut domains: Vec<String> = platforms::all(&st.db).into_iter().flat_map(|p| p.cookie_domains).collect();
                             domains.sort();
                             domains.dedup();
                             let _ = st.browser.persist_session_cookies(&domains).await;
                         }
-                        st.browser.shutdown().await;
                     };
-                    // 浏览器无响应时也不要拖住退出
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(8), work).await;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), backup).await;
+                    // 2) 正常关闭浏览器（让它把 Cookie 数据库写盘）：单独的预算，不被上一步挤占
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(7), st.browser.shutdown()).await;
                 });
             }
         });

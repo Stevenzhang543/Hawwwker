@@ -166,13 +166,17 @@ pub async fn summarize(ai: &AiClient, plan: &SearchPlan, items: &[ResultItem], d
         .map(|r| {
             json!({
                 "id": r.id, "platform": r.platform_id, "title": r.title, "price": r.price, "currency": r.currency,
-                "displayPrice": r.display_price, "verdict": r.match_info.verdict, "score": r.match_info.score,
+                "displayPrice": r.display_price, "displayLanded": r.display_landed, "verdict": r.match_info.verdict, "score": r.match_info.score,
                 "flags": r.match_info.flags, "shop": r.shop, "rating": r.rating, "sales": r.sales, "condition": r.condition,
-                "alsoOnCount": r.also_on.len(),
+                "alsoOnCount": r.also_on.len(), "finalScore": r.final_score,
+                "shopInfo": r.shop_info.as_ref().map(|s| json!({"type": s.label, "credibility": s.credibility})),
+                "risk": r.risk.as_ref().map(|x| json!({"level": x.level, "score": x.score, "summary": x.summary})),
+                "reviews": r.review_insight.as_ref().filter(|v| v.score.is_some()).map(|v| json!({"score": v.score, "rating": v.rating, "count": v.count, "pros": v.pros, "cons": v.cons, "redFlags": v.red_flags})),
+                "tags": r.tags.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
             })
         })
         .collect();
-    let prices: Vec<f64> = items.iter().filter(|r| r.match_info.verdict == "exact" || r.match_info.verdict == "close").filter_map(|r| r.display_price).collect();
+    let prices: Vec<f64> = items.iter().filter(|r| r.match_info.verdict == "exact" || r.match_info.verdict == "close").filter_map(|r| r.display_landed.or(r.display_price)).collect();
     let stats = if prices.is_empty() {
         json!(null)
     } else {
@@ -187,7 +191,8 @@ pub async fn summarize(ai: &AiClient, plan: &SearchPlan, items: &[ResultItem], d
     .to_string();
     let v: Value = ai.chat_json(prompts::SUMMARY, &user, false).await?;
     let ids: Vec<&str> = items.iter().map(|r| r.id.as_str()).collect();
-    let best = v["bestPick"]["id"].as_str().filter(|id| ids.contains(id)).map(|id| BestPick {
+    let high_risk: Vec<&str> = items.iter().filter(|r| r.risk.as_ref().is_some_and(|x| x.level == "high")).map(|r| r.id.as_str()).collect();
+    let best = v["bestPick"]["id"].as_str().filter(|id| ids.contains(id) && !high_risk.contains(id)).map(|id| BestPick {
         id: id.to_string(),
         why: v["bestPick"]["why"].as_str().unwrap_or("").chars().take(120).collect(),
     });
