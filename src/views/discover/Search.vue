@@ -1,17 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, openExternal, toAppError } from "@/api";
-import type { Region, ResultItem, SearchPlan, Verdict } from "@/api/types";
+import type { LinkInfo, Region, ResultItem, SearchPlan, Verdict } from "@/api/types";
 import { useAppStore } from "@/stores/app";
-import { useSearchStore } from "@/stores/search";
+import { itemKey, useSearchStore, visibleItems } from "@/stores/search";
 import { usePlatformStore } from "@/stores/platforms";
 import { useUiStore } from "@/stores/ui";
 import { useWatchStore } from "@/stores/watch";
 import { useCopilotStore } from "@/stores/copilot";
 import { useActions } from "@/composables/actions";
 import { EXAMPLES, VERDICT, RUN_STATUS, CONDITION } from "@/utils/labels";
-import { ago, money } from "@/utils/format";
+import { ago, copyText, money } from "@/utils/format";
+import { hasLandedInfo, isUrl, landedChips, landedDisplay } from "@/utils/landed";
 import CommandBox from "@/components/search/CommandBox.vue";
 import PlatformPicker from "@/components/search/PlatformPicker.vue";
 import LiveActivity from "@/components/search/LiveActivity.vue";
@@ -19,10 +20,14 @@ import PlanCard from "@/components/search/PlanCard.vue";
 import SummaryCard from "@/components/search/SummaryCard.vue";
 import ResultCard from "@/components/search/ResultCard.vue";
 import ResultDetail from "@/components/search/ResultDetail.vue";
+import LinkCard from "@/components/search/LinkCard.vue";
+import FilterPopover from "@/components/search/FilterPopover.vue";
+import { blankFilters, type ResultFilters } from "@/components/search/filters";
 import GSegmented from "@/components/ui/GSegmented.vue";
 import Icon from "@/components/ui/Icon.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 import PriceTag from "@/components/ui/PriceTag.vue";
+import DealBadge from "@/components/ui/DealBadge.vue";
 
 const app = useAppStore();
 const search = useSearchStore();
@@ -39,19 +44,22 @@ const region = ref<"all" | Region>(app.settings?.search.defaultRegion ?? "all");
 const selected = ref<string[]>([]);
 const busy = ref(false);
 const view = ref<"card" | "list" | "table">("card");
-const fPlatform = ref<string>("all");
 const fVerdict = ref<"good" | "all" | "exact">("good");
-const fCond = ref<"any" | "new" | "used">("any");
-const fMin = ref("");
-const fMax = ref("");
+const filters = ref<ResultFilters>(blankFilters());
 const sort = ref<"rank" | "price_asc" | "price_desc" | "score">("rank");
 const showHidden = ref(false);
-const detailId = ref<string | null>(null);
+const detailKey = ref<string | null>(null);
 const cmdBox = ref<InstanceType<typeof CommandBox> | null>(null);
+/** 有结果后指令框收成一行；点击后展开 */
+const cmdOpen = ref(false);
 
 const run = computed(() => search.current);
 const hasRun = computed(() => !!run.value);
 const running = computed(() => run.value?.status === "running");
+const items = computed(() => visibleItems(run.value));
+const hasItems = computed(() => items.value.length > 0);
+const provisional = computed(() => hasItems.value && !run.value?.results.length);
+const canExport = computed(() => run.value?.status === "done" && !!run.value.results.length);
 
 onMounted(async () => {
   if (!search.history.length) void search.loadHistory();
@@ -72,17 +80,92 @@ watch(
   () => search.currentId,
   () => {
     showHidden.value = false;
-    fPlatform.value = "all";
+    filters.value = blankFilters();
+    detailKey.value = null;
+    cmdOpen.value = false;
     if (run.value?.instruction) text.value = run.value.instruction;
   },
 );
 watch(region, () => (selected.value = selected.value.filter((id) => region.value === "all" || platforms.byId[id]?.region === region.value)));
 
+/* ---------------- 指令框（一行 ⇄ 展开） */
+function openCmd() {
+  cmdOpen.value = true;
+  void nextTick(() => cmdBox.value?.focus());
+}
+function closeCmd() {
+  if (hasRun.value) cmdOpen.value = false;
+}
+const showFullCmd = computed(() => !hasRun.value || cmdOpen.value);
+const scopeLabel = computed(() => {
+  if (selected.value.length) return selected.value.length <= 2 ? selected.value.map((id) => platforms.label(id)).join("、") : `${selected.value.length} 个平台`;
+  return region.value === "all" ? "AI 选平台" : region.value === "cn" ? "国内版" : "国际版";
+});
+
+/* ---------------- 粘贴商品链接 */
+const linkUrl = computed(() => (isUrl(text.value) ? text.value.trim() : ""));
+const link = reactive<{ url: string; info: LinkInfo | null; loading: boolean; error: string | null; watching: boolean; dismissed: string }>({
+  url: "", info: null, loading: false, error: null, watching: false, dismissed: "",
+});
+const showLink = computed(() => !!linkUrl.value && link.url === linkUrl.value && link.dismissed !== linkUrl.value && showFullCmd.value);
+let linkTimer = 0;
+watch(linkUrl, (u) => {
+  window.clearTimeout(linkTimer);
+  if (!u) return;
+  linkTimer = window.setTimeout(() => void inspect(u), 450);
+});
+onBeforeUnmount(() => window.clearTimeout(linkTimer));
+
+async function inspect(url: string) {
+  if (link.url === url && (link.info || link.loading)) return;
+  Object.assign(link, { url, info: null, loading: true, error: null, dismissed: "" });
+  try {
+    const info = await api.linkInspect(url);
+    if (link.url === url) link.info = info;
+  } catch (e) {
+    if (link.url === url) link.error = toAppError(e).message;
+  } finally {
+    if (link.url === url) link.loading = false;
+  }
+}
+function retryLink() {
+  const u = link.url;
+  link.url = "";
+  void inspect(u);
+}
+async function compareLink() {
+  if (!link.info) return;
+  const ins = link.info.instruction;
+  link.dismissed = link.url;
+  text.value = ins;
+  await go(ins);
+}
+async function watchLink() {
+  if (!link.info) return;
+  link.watching = true;
+  try {
+    const w = await watchStore.add({ url: link.url, title: link.info.title ?? undefined, platformId: link.info.platformId ?? undefined });
+    link.info.watchId = w.id;
+    ui.toast("已加入价格追踪", "success", 2800, w.title.slice(0, 32));
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  } finally {
+    link.watching = false;
+  }
+}
+
+/* ---------------- 搜索 */
 async function go(instruction?: string, plan?: SearchPlan) {
   const t = (instruction ?? text.value).trim();
   if (!t && !plan) {
     ui.toast("先说说你想找什么", "warn");
     cmdBox.value?.focus();
+    return;
+  }
+  // 输入的是链接：先识别，再由用户选择"找同款"或"追踪"；已识别时回车 = 找同款
+  if (!plan && isUrl(t)) {
+    if (link.url === t && link.info) return compareLink();
+    void inspect(t);
     return;
   }
   if (!app.ai.verified) {
@@ -102,6 +185,7 @@ async function go(instruction?: string, plan?: SearchPlan) {
     } else {
       await search.start(t);
     }
+    cmdOpen.value = false;
     if (route.query.run) void router.replace({ query: {} });
   } catch (e) {
     const err = toAppError(e);
@@ -149,20 +233,29 @@ async function saveMonitor(plan: SearchPlan) {
   }
 }
 
-/* ---------------- 结果筛选 */
-const results = computed(() => run.value?.results ?? []);
-const resultPlatforms = computed(() => [...new Set(results.value.map((r) => r.platformId))]);
-const price = (r: ResultItem) => r.displayPrice ?? app.toDisplay(r.price, r.currency);
+/* ---------------- 结果筛选（价格一律按到手价） */
+const price = (r: ResultItem) => landedDisplay(r, app.toDisplay);
+const marked = (r: ResultItem) => r.feedback === "irrelevant";
+const shown = computed(() => items.value.filter((r) => r.match.verdict !== "mismatch" && !marked(r)));
+const resultPlatforms = computed(() => [...new Set(items.value.map((r) => r.platformId))]);
+const counts = computed(() => {
+  const c: Record<string, number> = {};
+  for (const r of shown.value) c[r.platformId] = (c[r.platformId] ?? 0) + 1;
+  return c;
+});
 const filtered = computed(() => {
   const okV: Record<"good" | "all" | "exact", Verdict[]> = { good: ["exact", "close", "related"], all: ["exact", "close", "related"], exact: ["exact"] };
-  const min = fMin.value ? Number(fMin.value) : null;
-  const max = fMax.value ? Number(fMax.value) : null;
-  let out = results.value.filter((r) => r.match.verdict !== "mismatch" && okV[fVerdict.value].includes(r.match.verdict));
+  const f = filters.value;
+  const min = f.min ? Number(f.min) : null;
+  const max = f.max ? Number(f.max) : null;
+  let out = shown.value.filter((r) => okV[fVerdict.value].includes(r.match.verdict));
   if (fVerdict.value === "good") out = out.filter((r) => r.match.verdict !== "related" || r.match.score >= 50);
-  if (fPlatform.value !== "all") out = out.filter((r) => r.platformId === fPlatform.value);
-  if (fCond.value !== "any") out = out.filter((r) => r.condition === fCond.value);
+  if (f.platform !== "all") out = out.filter((r) => r.platformId === f.platform);
+  if (f.cond !== "any") out = out.filter((r) => r.condition === f.cond);
   if (min != null) out = out.filter((r) => (price(r) ?? 0) >= min);
   if (max != null) out = out.filter((r) => (price(r) ?? Infinity) <= max);
+  if (f.freeShip) out = out.filter((r) => r.shipping === 0);
+  if (f.goodDeal) out = out.filter((r) => r.deal?.level === "lowest" || r.deal?.level === "low");
   const s = [...out];
   if (sort.value === "price_asc") s.sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15));
   else if (sort.value === "price_desc") s.sort((a, b) => (price(b) ?? -1) - (price(a) ?? -1));
@@ -170,17 +263,73 @@ const filtered = computed(() => {
   else s.sort((a, b) => a.rank - b.rank);
   return s;
 });
-const hidden = computed(() => results.value.filter((r) => r.match.verdict === "mismatch"));
+const hidden = computed(() => items.value.filter((r) => r.match.verdict === "mismatch" || marked(r)));
+const userMarked = computed(() => hidden.value.filter(marked).length);
 const bestId = computed(() => run.value?.summary?.bestPick?.id ?? null);
-const showSkeleton = computed(() => running.value && !results.value.length && ["extract", "verify", "rank", "search"].includes(run.value?.stage ?? ""));
+const showSkeleton = computed(() => running.value && !hasItems.value && ["extract", "verify", "rank", "search"].includes(run.value?.stage ?? ""));
 const examples = computed(() => EXAMPLES[app.role] ?? EXAMPLES.consumer);
 const recent = computed(() => search.history.slice(0, 4));
 
+/* ---------------- 详情（按稳定键跟踪：初判 → 最终结果时自动切到正式记录） */
+const detailItem = computed(() => (detailKey.value ? items.value.find((x) => itemKey(x) === detailKey.value) ?? null : null));
 function openDetail(r: ResultItem) {
-  detailId.value = r.id;
+  detailKey.value = itemKey(r);
 }
 function ask(r: ResultItem) {
   copilot.openWith(r);
+}
+function onWatch(r: ResultItem) {
+  if (r.provisional) {
+    ui.toast("AI 核对完成后即可追踪", "info", 2200);
+    return;
+  }
+  void watchItem(r);
+}
+
+/* ---------------- 不相关反馈 + 撤销 */
+const undo = ref<ResultItem | null>(null);
+let undoTimer = 0;
+async function feedback(r: ResultItem, kind: "irrelevant" | "clear") {
+  if (!run.value) return;
+  try {
+    await search.setFeedback(run.value.runId, r, kind);
+    window.clearTimeout(undoTimer);
+    if (kind === "irrelevant") {
+      undo.value = r;
+      undoTimer = window.setTimeout(() => (undo.value = null), 6000);
+    } else {
+      undo.value = null;
+      ui.toast("已恢复到结果列表", "success", 1800);
+    }
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  }
+}
+function undoFeedback() {
+  const r = undo.value;
+  if (r) void feedback(r, "clear");
+}
+onBeforeUnmount(() => window.clearTimeout(undoTimer));
+
+/* ---------------- 分享 / 导出 */
+async function copyList() {
+  if (!run.value) return;
+  try {
+    const t = await api.runExport(run.value.runId, "text");
+    const ok = await copyText(t);
+    ui.toast(ok ? "比价清单已复制" : "复制失败", ok ? "success" : "error", 2800, ok ? "可直接粘贴到微信、邮件或备忘录" : undefined);
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  }
+}
+async function exportCsv() {
+  if (!run.value) return;
+  try {
+    const path = await api.runExport(run.value.runId, "csv");
+    ui.toast("已导出 CSV（含到手价）", "success", 5000, path);
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  }
 }
 
 const regionOpts = [
@@ -202,17 +351,51 @@ const verdictOpts = [
 
 <template>
   <div class="page search-page">
-    <section class="hero" :class="{ compact: hasRun }">
+    <!-- 指令：无结果时是大输入框；有结果后收成一行 -->
+    <section v-if="!showFullCmd && run" class="cmd-line glass">
+      <span class="cl-ico"><Icon name="spark" :size="15" /></span>
+      <button class="cl-text" title="点击修改指令" @click="openCmd">
+        <span class="ellipsis">{{ run.instruction || run.plan?.instruction || text }}</span>
+      </button>
+      <span class="chip outline cl-scope" title="平台范围（展开后可修改）">{{ scopeLabel }}</span>
+      <button class="btn sm ghost" @click="openCmd"><Icon name="edit" />修改</button>
+      <button class="btn sm" @click="newSearch"><Icon name="plus" />新搜索</button>
+    </section>
+
+    <section v-else class="hero" :class="{ compact: hasRun }">
       <div v-if="!hasRun" class="hero-text">
         <p class="eyebrow">AI 多平台购物搜索</p>
         <h1>今天想<span class="grad">找点什么</span>？</h1>
-        <p class="muted">说出品牌型号、预算和平台，Hawwwker 会在你登录好的各平台上替你搜索、校验和比价。</p>
+        <p class="muted">说出品牌型号、预算和平台，或直接粘贴商品链接。Hawwwker 会在你登录好的各平台上替你搜索、核对和比价。</p>
       </div>
       <div v-else class="hero-row-top">
         <button class="btn ghost sm" @click="newSearch"><Icon name="plus" />新搜索</button>
-        <span class="faint tiny">修改指令后回车即可重新搜索</span>
+        <span class="faint tiny">修改指令后回车即可重新搜索 · Esc 收起</span>
+        <span class="spacer"></span>
+        <button class="icon-btn" title="收起" @click="closeCmd"><Icon name="up" :size="16" /></button>
       </div>
-      <CommandBox ref="cmdBox" v-model="text" :busy="busy || search.pendingPlan || running" :compact="hasRun" @run="go()" />
+      <CommandBox
+        ref="cmdBox"
+        v-model="text"
+        :busy="busy || search.pendingPlan || running"
+        :compact="hasRun"
+        :link="!!linkUrl"
+        @run="go()"
+        @escape="closeCmd"
+      />
+      <LinkCard
+        v-if="showLink"
+        :url="link.url"
+        :info="link.info"
+        :loading="link.loading"
+        :error="link.error"
+        :watching="link.watching"
+        @compare="compareLink"
+        @watch="watchLink"
+        @view="(id) => router.push(`/track/watchlist?id=${id}`)"
+        @retry="retryLink"
+        @close="link.dismissed = link.url"
+      />
       <div class="hero-row">
         <GSegmented v-model="region" :options="regionOpts" small />
         <PlatformPicker v-model="selected" :region="region" />
@@ -244,39 +427,38 @@ const verdictOpts = [
         </section>
       </div>
 
-      <div v-else key="run" class="stack">
-        <LiveActivity v-if="run" :run="run" @cancel="cancel" @show-browser="showBrowser" />
-        <Transition name="blur">
-          <SummaryCard v-if="run?.summary" :summary="run.summary" :results="results" @action="runAction" @open="openDetail" />
-        </Transition>
-        <PlanCard v-if="run?.plan" :plan="run.plan" :running="running" :collapsed="!running && !!run.summary" @rerun="(p) => go(p.instruction, p)" @monitor="saveMonitor" />
+      <div v-else key="run" class="stack run-stack">
+        <LiveActivity v-if="run" :run="run" :slim="hasItems" @cancel="cancel" @show-browser="showBrowser" />
+        <PlanCard v-if="run?.plan" :plan="run.plan" :running="running" @rerun="(p) => go(p.instruction, p)" @monitor="saveMonitor" />
 
-        <template v-if="results.length || showSkeleton">
+        <!-- 总结位：先用一条状态占位，总结到达后原位替换，不把结果往下推 -->
+        <template v-if="hasItems">
+          <SummaryCard v-if="run?.summary" :summary="run.summary" :results="items" @action="runAction" @open="openDetail" />
+          <div v-else-if="running" class="sum-wait glass">
+            <span class="sw-ico"><Icon name="spark" :size="15" /></span>
+            <span v-if="provisional" class="small">
+              已出 <b class="num">{{ items.length }}</b> 条初步结果（规则初判）· AI 正在逐条核对，完成后原位更新
+            </span>
+            <span v-else class="small">AI 已核对完毕，正在写总结与推荐…</span>
+            <span class="spacer"></span>
+            <span class="dots"><i></i><i></i><i></i></span>
+          </div>
+        </template>
+
+        <template v-if="hasItems || showSkeleton">
           <div class="toolbar glass">
             <GSegmented v-model="fVerdict" :options="verdictOpts" small />
-            <select v-model="fPlatform" class="select sm" style="width: 150px">
-              <option value="all">全部平台（{{ resultPlatforms.length }}）</option>
-              <option v-for="id in resultPlatforms" :key="id" :value="id">{{ platforms.label(id) }}</option>
-            </select>
-            <select v-model="fCond" class="select sm" style="width: 104px">
-              <option value="any">不限成色</option>
-              <option value="new">全新</option>
-              <option value="used">二手</option>
-            </select>
-            <div class="range">
-              <input v-model="fMin" class="input sm" type="number" placeholder="最低" />
-              <span class="faint">–</span>
-              <input v-model="fMax" class="input sm" type="number" placeholder="最高" />
-              <span class="faint tiny">{{ app.displayCurrency }}</span>
-            </div>
-            <select v-model="sort" class="select sm" style="width: 128px">
+            <select v-model="sort" class="select sm" style="width: 132px" title="价格排序按到手价（券后 + 运费）">
               <option value="rank">综合排序</option>
-              <option value="price_asc">价格从低到高</option>
-              <option value="price_desc">价格从高到低</option>
+              <option value="price_asc">到手价从低到高</option>
+              <option value="price_desc">到手价从高到低</option>
               <option value="score">匹配度</option>
             </select>
+            <FilterPopover v-model="filters" :platforms="resultPlatforms" :currency="app.displayCurrency" :counts="counts" />
             <span class="spacer"></span>
-            <span class="faint tiny">{{ filtered.length }} 条</span>
+            <span class="faint tiny">{{ filtered.length }} 条<template v-if="provisional"> · 初判</template></span>
+            <button class="btn sm ghost" :disabled="!canExport" :title="canExport ? '复制为可粘贴的比价清单' : '搜索完成后可复制'" @click="copyList"><Icon name="copy" />复制清单</button>
+            <button class="btn sm ghost" :disabled="!canExport" :title="canExport ? '导出本次结果（含到手价）为 CSV' : '搜索完成后可导出'" @click="exportCsv"><Icon name="download" />CSV</button>
             <GSegmented v-model="view" :options="viewOpts" small>
               <template #option="{ option }"><span class="vt" :title="option.label"><Icon :name="option.icon!" :size="15" /></span></template>
             </GSegmented>
@@ -286,37 +468,42 @@ const verdictOpts = [
             <div v-for="i in 8" :key="i" class="skel" style="height: 300px; border-radius: 20px"></div>
           </div>
 
-          <div v-else-if="view === 'card'" class="grid g4 stagger results">
+          <TransitionGroup v-else-if="view === 'card'" tag="div" name="rg" class="grid g4 stagger results">
             <ResultCard
               v-for="(r, i) in filtered"
-              :key="r.id"
+              :key="itemKey(r)"
               :item="r"
               :best="r.id === bestId"
               :style="{ '--i': Math.min(i, 12) }"
               @open="openDetail(r)"
-              @watch="watchItem(r)"
+              @watch="onWatch(r)"
               @copilot="ask(r)"
               @external="openExternal(r.url)"
               @copy="copyLink(r.url)"
+              @irrelevant="feedback(r, 'irrelevant')"
             />
-          </div>
+          </TransitionGroup>
 
           <div v-else-if="view === 'list'" class="glass list stagger">
-            <div v-for="(r, i) in filtered" :key="r.id" class="li" :style="{ '--i': Math.min(i, 12) }" @click="openDetail(r)">
+            <div v-for="(r, i) in filtered" :key="itemKey(r)" class="li" :style="{ '--i': Math.min(i, 12) }" @click="openDetail(r)">
               <img v-if="r.image" :src="r.image" alt="" />
               <div class="li-main">
                 <div class="row" style="gap: 8px">
                   <PlatformBadge :id="r.platformId" />
-                  <span class="chip" :class="VERDICT[r.match.verdict].tone">{{ VERDICT[r.match.verdict].label }} {{ r.match.score }}</span>
+                  <span v-if="r.provisional" class="chip purple"><Icon name="refresh" :size="11" class="spin" />AI 核对中</span>
+                  <span v-else class="chip" :class="VERDICT[r.match.verdict].tone">{{ VERDICT[r.match.verdict].label }} {{ r.match.score }}</span>
                   <span v-if="r.id === bestId" class="chip amber">AI 推荐</span>
+                  <DealBadge :deal="r.deal" compact />
+                  <span v-for="c in landedChips(r)" :key="c.text" class="chip" :class="c.tone" :title="c.title">{{ c.text }}</span>
                 </div>
                 <p class="ellipsis li-title">{{ r.title }}</p>
                 <p class="faint tiny ellipsis">{{ r.match.reasons.join(" · ") }}</p>
               </div>
-              <PriceTag :price="r.price" :currency="r.currency" :display="r.displayPrice" />
+              <PriceTag :price="r.price" :currency="r.currency" :display="r.displayPrice" :landed="r.landedPrice" :display-landed="r.displayLanded" :landed-label="hasLandedInfo(r)" />
               <div class="row" @click.stop>
-                <button class="btn sm" @click="openExternal(r.url)"><Icon name="external" /></button>
-                <button class="btn sm" :disabled="r.watched" @click="watchItem(r)"><Icon :name="r.watched ? 'check' : 'tag'" /></button>
+                <button class="btn sm" title="在平台中打开" @click="openExternal(r.url)"><Icon name="external" /></button>
+                <button class="btn sm" :disabled="r.watched || r.provisional" title="追踪" @click="onWatch(r)"><Icon :name="r.watched ? 'check' : 'tag'" /></button>
+                <button class="btn sm ghost" title="不相关" @click="feedback(r, 'irrelevant')"><Icon name="x" /></button>
               </div>
             </div>
           </div>
@@ -324,17 +511,26 @@ const verdictOpts = [
           <div v-else class="glass table-wrap">
             <table class="table">
               <thead>
-                <tr><th>商品</th><th>平台</th><th class="r">原币价格</th><th class="r">换算（{{ app.displayCurrency }}）</th><th>匹配</th><th>成色</th><th>店铺</th><th></th></tr>
+                <tr>
+                  <th>商品</th><th>平台</th><th class="r">标价</th><th class="r">到手价（{{ app.displayCurrency }}）</th><th>价格判断</th><th>匹配</th><th>成色</th><th>店铺</th><th></th>
+                </tr>
               </thead>
               <tbody>
-                <tr v-for="r in [...filtered].sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15))" :key="r.id" @click="openDetail(r)" style="cursor: pointer">
-                  <td style="max-width: 320px"><div class="ellipsis" :title="r.title">{{ r.title }}</div></td>
+                <tr v-for="r in [...filtered].sort((a, b) => (price(a) ?? 1e15) - (price(b) ?? 1e15))" :key="itemKey(r)" style="cursor: pointer" @click="openDetail(r)">
+                  <td style="max-width: 240px"><div class="ellipsis" :title="r.title">{{ r.title }}</div></td>
                   <td><PlatformBadge :id="r.platformId" /></td>
                   <td class="r"><span class="price">{{ money(r.price, r.currency) }}</span></td>
-                  <td class="r"><span class="price" :class="{ amber: r.id === bestId }">{{ money(price(r), app.displayCurrency) }}</span></td>
-                  <td><span class="chip" :class="VERDICT[r.match.verdict].tone">{{ VERDICT[r.match.verdict].label }}</span></td>
-                  <td class="faint">{{ CONDITION[r.condition] }}</td>
-                  <td class="faint ellipsis" style="max-width: 120px">{{ r.shop ?? "—" }}</td>
+                  <td class="r">
+                    <span class="price" :class="{ amber: r.id === bestId }">{{ money(price(r), app.displayCurrency) }}</span>
+                    <div class="tiny faint">{{ landedChips(r).map((c) => c.text).join(" · ") }}</div>
+                  </td>
+                  <td><DealBadge :deal="r.deal" compact /></td>
+                  <td>
+                    <span v-if="r.provisional" class="chip purple">核对中</span>
+                    <span v-else class="chip" :class="VERDICT[r.match.verdict].tone">{{ VERDICT[r.match.verdict].label }}</span>
+                  </td>
+                  <td class="faint nw">{{ CONDITION[r.condition] }}</td>
+                  <td class="faint nw"><div class="ellipsis" style="max-width: 96px" :title="r.shop ?? ''">{{ r.shop ?? "—" }}</div></td>
                   <td class="r" @click.stop><button class="btn ghost sm" @click="openExternal(r.url)"><Icon name="external" />打开</button></td>
                 </tr>
               </tbody>
@@ -344,14 +540,14 @@ const verdictOpts = [
           <div v-if="!showSkeleton && !filtered.length" class="empty glass">
             <div class="empty-icon"><Icon name="filter" /></div>
             <h3>没有符合筛选条件的结果</h3>
-            <p>试试放宽价格区间、切换到「全部相关」或选择全部平台。</p>
+            <p>试试放宽到手价区间、切换到「全部相关」或在「筛选」里选择全部平台。</p>
           </div>
 
           <section v-if="hidden.length" class="hidden-box glass">
             <button class="hb-head" @click="showHidden = !showHidden">
               <Icon name="eye" :size="16" />
               <b>可能不相关 {{ hidden.length }} 条</b>
-              <span class="faint small">AI 判断为配件、不同产品或广告，默认折叠以免干扰</span>
+              <span class="faint small">AI 判断为配件、不同产品或广告<template v-if="userMarked">，含你标记的 {{ userMarked }} 条</template>，默认折叠以免干扰</span>
               <span class="spacer"></span>
               <Icon name="down" :size="15" :style="{ transform: showHidden ? 'rotate(180deg)' : '', transition: 'transform .3s' }" />
             </button>
@@ -359,13 +555,15 @@ const verdictOpts = [
               <div v-if="showHidden" class="grid g4" style="padding: 0 14px 14px">
                 <ResultCard
                   v-for="r in hidden"
-                  :key="r.id"
+                  :key="itemKey(r)"
                   :item="r"
                   @open="openDetail(r)"
-                  @watch="watchItem(r)"
+                  @watch="onWatch(r)"
                   @copilot="ask(r)"
                   @external="openExternal(r.url)"
                   @copy="copyLink(r.url)"
+                  @irrelevant="feedback(r, 'irrelevant')"
+                  @restore="feedback(r, 'clear')"
                 />
               </div>
             </Transition>
@@ -374,11 +572,67 @@ const verdictOpts = [
       </div>
     </Transition>
 
-    <ResultDetail :id="detailId" @close="detailId = null" />
+    <div class="undo-wrap">
+      <Transition name="pop">
+        <div v-if="undo" class="undo glass-3" role="status">
+          <Icon name="eye" :size="15" />
+          <span class="ellipsis">已把「{{ undo.title.slice(0, 22) }}{{ undo.title.length > 22 ? "…" : "" }}」标为不相关，折叠到「可能不相关」；同一需求以后自动排除</span>
+          <button class="btn sm" @click="undoFeedback">撤销</button>
+        </div>
+      </Transition>
+    </div>
+
+    <ResultDetail
+      :id="detailItem?.id ?? null"
+      :fallback="detailItem"
+      @close="detailKey = null"
+      @feedback="(k) => detailItem && feedback(detailItem, k)"
+    />
   </div>
 </template>
 
 <style scoped>
+.run-stack {
+  gap: 12px;
+}
+.cmd-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 10px;
+  border-radius: 16px;
+  min-width: 0;
+}
+.cl-ico {
+  width: 28px;
+  height: 28px;
+  flex: none;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--brand-grad);
+  color: #fff;
+}
+.cl-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: text;
+  padding: 6px 4px;
+  border-radius: 8px;
+}
+.cl-text:hover {
+  background: var(--hover);
+}
+.cl-scope {
+  flex: none;
+}
 .hero {
   display: flex;
   flex-direction: column;
@@ -392,6 +646,7 @@ const verdictOpts = [
 .hero.compact {
   padding: 0;
   max-width: none;
+  gap: 10px;
 }
 .hero-text {
   text-align: center;
@@ -482,6 +737,41 @@ const verdictOpts = [
   flex: 1;
   font-size: 13px;
 }
+.sum-wait {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px 8px 12px;
+  min-height: 56px;
+  color: var(--text-2);
+}
+.sw-ico {
+  width: 28px;
+  height: 28px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  background: var(--purple-bg);
+  color: var(--purple);
+  flex: none;
+}
+.dots {
+  display: inline-flex;
+  gap: 4px;
+}
+.dots i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--purple);
+  animation: pulse 1s infinite;
+}
+.dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
 .toolbar {
   position: sticky;
   top: 64px;
@@ -489,17 +779,9 @@ const verdictOpts = [
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 7px 10px;
   border-radius: 16px;
   flex-wrap: wrap;
-}
-.range {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.range .input {
-  width: 64px;
 }
 .vt {
   display: inline-grid;
@@ -507,6 +789,12 @@ const verdictOpts = [
 }
 .results {
   align-items: stretch;
+}
+.rg-move {
+  transition: transform 520ms var(--spring-soft);
+}
+.rg-leave-active {
+  display: none;
 }
 .list {
   padding: 4px;
@@ -543,6 +831,10 @@ const verdictOpts = [
   padding: 6px 8px;
   overflow-x: auto;
 }
+.table-wrap .nw,
+.table-wrap th {
+  white-space: nowrap;
+}
 .hidden-box {
   padding: 0;
   overflow: hidden;
@@ -558,6 +850,27 @@ const verdictOpts = [
   cursor: pointer;
   text-align: left;
 }
+.undo-wrap {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 26px;
+  z-index: 70;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.undo {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(680px, calc(100vw - 48px));
+  padding: 8px 8px 8px 14px;
+  border-radius: 14px;
+  box-shadow: var(--shadow-3);
+  font-size: 13px;
+}
 @media (max-width: 1280px) {
   .results.g4,
   .grid.g4 {
@@ -568,6 +881,9 @@ const verdictOpts = [
   .results.g4,
   .grid.g4 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cl-scope {
+    display: none;
   }
 }
 </style>

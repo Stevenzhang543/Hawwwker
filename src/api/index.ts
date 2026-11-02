@@ -6,6 +6,7 @@ import type {
   CopilotMessage, CopilotSendInput, CopilotSkill, CustomPlatformInput, FxRates, ListingDetail, LoginState, MarketOverview,
   Monitor, MonitorCreateInput, MonitorPatch, Notice, PlatformInfo, PlatformPatch, PricePoint, RunDetail, RunEvent,
   RunSummary, SearchPlan, TrendSeries, WatchAddInput, WatchItem, WatchPatch,
+  LinkInfo, LocalAi, Recommendation, SelfTestResult,
 } from "./types";
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -54,12 +55,15 @@ export const api = {
   aiTest: () => call<AiStatus>("ai_test"),
   aiPresets: () => call<AiPreset[]>("ai_presets"),
   aiUsage: () => call<AiUsage>("ai_usage"),
+  aiDetectLocal: () => call<LocalAi>("ai_detect_local"),
 
   /* platforms & login */
   platformsList: () => call<PlatformInfo[]>("platforms_list"),
   platformUpdate: (id: string, patch: PlatformPatch) => call<PlatformInfo>("platform_update", { id, patch }),
   platformAddCustom: (input: CustomPlatformInput) => call<PlatformInfo>("platform_add_custom", { input }),
   platformRemoveCustom: (id: string) => call<void>("platform_remove_custom", { id }),
+  platformsRecommend: (timezone: string, language: string) => call<Recommendation>("platforms_recommend", { timezone, language }),
+  platformSelftest: (ids: string[], query?: string) => call<SelfTestResult[]>("platform_selftest", { ids, query: query ?? null }),
   loginStates: (refresh = false) => call<LoginState[]>("login_states", { refresh }),
   loginStart: (platformId: string) => call<LoginState>("login_start", { platformId }),
   loginConfirm: (platformId: string) => call<LoginState>("login_confirm", { platformId }),
@@ -79,6 +83,11 @@ export const api = {
   searchRun: (runId: string) => call<RunDetail>("search_run", { runId }),
   searchDeleteRun: (runId: string) => call<void>("search_delete_run", { runId }),
   listingGet: (id: string) => call<ListingDetail>("listing_get", { id }),
+  linkInspect: (url: string) => call<LinkInfo>("link_inspect", { url }),
+  /** kind: "irrelevant" | "clear" */
+  feedbackSet: (listingId: string, runId: string, kind: "irrelevant" | "clear") => call<void>("feedback_set", { listingId, runId, kind }),
+  /** format: "text" 返回可粘贴清单；"csv" 写文件并返回路径 */
+  runExport: (runId: string, format: "text" | "csv") => call<string>("run_export", { runId, format }),
 
   /* watch */
   watchList: () => call<WatchItem[]>("watch_list"),

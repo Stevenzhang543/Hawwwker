@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import { openExternal } from "@/api";
 import type { Notice, NoticeKind } from "@/api/types";
 import { NOTICE_META, useNoticeStore } from "@/stores/notices";
 import { ago, dateTime } from "@/utils/format";
@@ -22,6 +23,10 @@ function open(n: Notice) {
   void notices.read(n.id);
   if (n.link) void router.push(n.link);
 }
+function buy(n: Notice) {
+  void notices.read(n.id);
+  void openExternal(n.url);
+}
 const opts = [
   { value: "all" as const, label: "全部" },
   { value: "unread" as const, label: "未读" },
@@ -40,10 +45,12 @@ const opts = [
         <h1>提醒中心</h1>
         <p>降价、达到目标价、监控新品、登录过期与错误都会汇总在这里，同时推送系统通知。</p>
       </div>
-      <span class="spacer"></span>
-      <button class="btn" :disabled="!notices.unread" @click="notices.readAll()"><Icon name="check" />全部已读</button>
     </div>
-    <GSegmented v-model="kind" :options="opts" small />
+    <div class="row">
+      <GSegmented v-model="kind" :options="opts" small />
+      <span class="spacer"></span>
+      <button class="btn sm" :disabled="!notices.unread" @click="notices.readAll()"><Icon name="check" />全部已读</button>
+    </div>
 
     <div v-if="!notices.loaded" class="col"><div v-for="i in 5" :key="i" class="skel" style="height: 70px"></div></div>
     <div v-else-if="!rows.length" class="empty glass">
@@ -53,7 +60,7 @@ const opts = [
     </div>
     <div v-else class="timeline">
       <TransitionGroup name="list">
-        <button v-for="n in rows" :key="n.id" class="tl glass" :class="{ unread: !n.read }" @click="open(n)">
+        <div v-for="n in rows" :key="n.id" class="tl glass" :class="{ unread: !n.read }" role="button" tabindex="0" @click="open(n)" @keydown.enter="open(n)">
           <span class="tl-ico chip" :class="NOTICE_META[n.kind].tone"><Icon :name="NOTICE_META[n.kind].icon" :size="17" /></span>
           <span class="tl-body">
             <span class="row" style="gap: 8px">
@@ -67,8 +74,9 @@ const opts = [
             <span>{{ ago(n.createdAt) }}</span>
             <small class="faint">{{ dateTime(n.createdAt) }}</small>
           </span>
+          <button v-if="n.url" v-ripple class="btn primary sm buy" title="在浏览器打开商品页，下单仍由你确认" @click.stop="buy(n)"><Icon name="cart" />去购买</button>
           <Icon v-if="n.link" name="chevron" :size="16" class="faint" />
-        </button>
+        </div>
       </TransitionGroup>
     </div>
   </div>
@@ -91,6 +99,13 @@ const opts = [
   border-radius: 18px;
   transition: transform var(--t-mid) var(--spring), box-shadow var(--t-mid);
   width: 100%;
+}
+.buy {
+  flex: none;
+}
+.tl:focus-visible {
+  outline: 2px solid var(--brand-1);
+  outline-offset: 2px;
 }
 .tl:hover {
   transform: translateX(3px);

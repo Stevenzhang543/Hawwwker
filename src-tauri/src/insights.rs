@@ -69,10 +69,10 @@ pub fn overview(db: &Db, fx: &Fx, days: i64, display: &str) -> AppResult<MarketO
         .iter()
         .map(|(p, v)| PlatformMedian { platform_id: p.clone(), median: (median(&mut v.clone()) * 100.0).round() / 100.0, count: v.len() as i64 })
         .collect();
-    platform_medians.sort_by(|a, b| b.count.cmp(&a.count));
+    platform_medians.sort_by_key(|x| std::cmp::Reverse(x.count));
     platform_medians.truncate(10);
     let mut platform_share: Vec<PlatformCount> = by_p.iter().map(|(p, v)| PlatformCount { platform_id: p.clone(), count: v.len() as i64 }).collect();
-    platform_share.sort_by(|a, b| b.count.cmp(&a.count));
+    platform_share.sort_by_key(|x| std::cmp::Reverse(x.count));
 
     // 价格带：按分位数取"整齐"的边界
     let mut prices: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();

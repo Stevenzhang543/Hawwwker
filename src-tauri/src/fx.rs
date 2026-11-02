@@ -54,32 +54,43 @@ impl Fx {
         }
     }
 
+    /// 刷新汇率：先 ECB（frankfurter.app），失败再用 open.er-api.com；都失败保留缓存或内置表。
     pub async fn refresh(&self, db: &Db, http: &reqwest::Client) -> Result<(), String> {
-        #[derive(serde::Deserialize)]
-        struct Resp {
-            base: String,
-            date: String,
-            rates: BTreeMap<String, f64>,
+        let mut errors = vec![];
+        for (source, url) in [("ecb", "https://api.frankfurter.app/latest?from=EUR"), ("er-api", "https://open.er-api.com/v6/latest/EUR")] {
+            match Self::fetch(http, url).await {
+                Ok((date, mut rates)) => {
+                    rates.insert("EUR".into(), 1.0);
+                    if rates.len() < 10 || !rates.contains_key("CNY") || !rates.contains_key("USD") {
+                        errors.push(format!("{source}: 数据不完整"));
+                        continue;
+                    }
+                    let fx = FxRates { base: "EUR".into(), date, source: source.into(), rates };
+                    let _ = db.put_setting("fx_cache", &fx);
+                    let _ = db.put_setting("fx_fetched_at", &now_iso());
+                    if let Ok(mut w) = self.rates.write() {
+                        *w = fx;
+                    }
+                    return Ok(());
+                }
+                Err(e) => errors.push(format!("{source}: {e}")),
+            }
         }
-        let resp = http
-            .get("https://api.frankfurter.app/latest?from=EUR")
-            .timeout(std::time::Duration::from_secs(12))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        Err(errors.join("；"))
+    }
+
+    async fn fetch(http: &reqwest::Client, url: &str) -> Result<(String, BTreeMap<String, f64>), String> {
+        let resp = http.get(url).timeout(std::time::Duration::from_secs(12)).send().await.map_err(|e| e.without_url().to_string())?;
         if !resp.status().is_success() {
             return Err(format!("HTTP {}", resp.status()));
         }
-        let data: Resp = resp.json().await.map_err(|e| e.to_string())?;
-        let mut rates = data.rates;
-        rates.insert(data.base.clone(), 1.0);
-        let fx = FxRates { base: data.base, date: data.date, source: "ecb".into(), rates };
-        let _ = db.put_setting("fx_cache", &fx);
-        let _ = db.put_setting("fx_fetched_at", &now_iso());
-        if let Ok(mut w) = self.rates.write() {
-            *w = fx;
-        }
-        Ok(())
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        let date = v["date"].as_str().or_else(|| v["time_last_update_utc"].as_str()).unwrap_or("").chars().take(16).collect::<String>();
+        let rates: BTreeMap<String, f64> = v["rates"]
+            .as_object()
+            .map(|m| m.iter().filter_map(|(k, x)| x.as_f64().filter(|f| *f > 0.0).map(|f| (k.to_uppercase(), f))).collect())
+            .unwrap_or_default();
+        Ok((date, rates))
     }
 }
 

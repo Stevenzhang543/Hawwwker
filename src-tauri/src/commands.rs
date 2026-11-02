@@ -202,6 +202,7 @@ pub async fn browser_info(state: S<'_>) -> AppResult<BrowserInfo> {
         executable: state.browser.executable(),
         running: state.browser.alive().await,
         profile_dir: state.browser.profile_dir().display().to_string(),
+        transport: state.browser.transport().to_string(),
     })
 }
 
@@ -420,4 +421,190 @@ pub fn copilot_send(app: AppHandle, state: S<'_>, input: CopilotSendInput) -> Ap
 #[tauri::command]
 pub fn copilot_reset(state: S<'_>, session_id: String) -> AppResult<()> {
     copilot::reset(&state.db, &session_id)
+}
+
+/* ------------------------------------------------------------------ v26.02 */
+/// 粘贴商品链接：识别平台，打开商品页读取标题与价格，给出"全网找同款"指令。
+#[tauri::command]
+pub async fn link_inspect(state: S<'_>, url: String) -> AppResult<LinkInfo> {
+    let st = state.inner().clone();
+    let url = url.trim().to_string();
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(AppError::invalid("请粘贴以 http:// 或 https:// 开头的商品链接"));
+    }
+    let all = platforms::all(&st.db);
+    let plat = all.iter().find(|p| p.host_matches(&url)).cloned();
+    let watch_id: Option<i64> = st.db.conn().query_row("SELECT id FROM watches WHERE url=?1 LIMIT 1", [&url], |r| r.get(0)).ok();
+    let mut info = LinkInfo {
+        url: url.clone(),
+        platform_id: plat.as_ref().map(|p| p.id.clone()),
+        platform_name: plat.as_ref().map(|p| format!("{} {}", p.name, p.edition)),
+        watch_id,
+        ..Default::default()
+    };
+    match crate::browser::extract::probe(&st.browser, plat.as_ref(), &url).await {
+        Ok(pr) => {
+            if pr.login_wall {
+                info.message = Some("商品页要求登录，可先到「平台 · 账号」登录；也可以直接用链接追踪".into());
+            }
+            let title = pr.title.trim().to_string();
+            if !title.is_empty() && !title.starts_with("http") {
+                info.title = Some(title.chars().take(160).collect());
+            }
+            info.price = pr.price.or_else(|| {
+                plat.as_ref().and_then(|p| pr.big_prices.iter().find_map(|t| crate::search::parse::prices_in(t, p).into_iter().next().map(|h| h.value)))
+            });
+            info.currency = pr.currency.clone().or_else(|| plat.as_ref().map(|p| p.currency.clone()));
+            info.image = Some(pr.image.clone()).filter(|i| i.starts_with("http"));
+        }
+        Err(e) => info.message = Some(format!("没能打开商品页：{e}")),
+    }
+    let short: String = info.title.clone().unwrap_or_default().chars().take(60).collect();
+    info.instruction = if short.is_empty() { String::new() } else { format!("全网找同款比价：{short}") };
+    Ok(info)
+}
+
+/// 结果反馈：irrelevant = 标记不相关（同一需求以后自动折叠）；clear = 撤销。
+#[tauri::command]
+pub fn feedback_set(state: S<'_>, listing_id: String, run_id: String, kind: String) -> AppResult<()> {
+    if kind != "irrelevant" && kind != "clear" {
+        return Err(AppError::invalid("未知的反馈类型"));
+    }
+    let (platform_id, external_id) = if let Some(rest) = listing_id.strip_prefix("p:") {
+        let mut it = rest.splitn(2, ':');
+        (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
+    } else {
+        state.db.conn().query_row("SELECT platform_id, external_id FROM listings WHERE id=?1", [&listing_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+    };
+    let plan: SearchPlan = state
+        .db
+        .conn()
+        .query_row("SELECT plan FROM runs WHERE id=?1", [&run_id], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|p| serde_json::from_str(&p).ok())
+        .ok_or_else(|| AppError::not_found("搜索记录"))?;
+    crate::deal::set_feedback(&state.db, &platform_id, &external_id, &crate::deal::scope_of(&plan), &kind)?;
+    Ok(())
+}
+
+/// 导出一次搜索：csv = 写文件并返回路径；text = 返回可直接粘贴的比价清单。
+#[tauri::command]
+pub fn run_export(app: AppHandle, state: S<'_>, run_id: String, format: String) -> AppResult<String> {
+    let s = settings::load(&state.db);
+    let d = pipeline::run_detail(&state.db, &state.fx, &run_id, &s.display_currency)?;
+    let items: Vec<&ResultItem> = d.results.iter().filter(|r| r.match_info.verdict != "mismatch" && r.feedback.is_none()).collect();
+    let all = platforms::all(&state.db);
+    let pname = |id: &str| all.iter().find(|p| p.id == id).map(|p| format!("{} {}", p.name, p.edition)).unwrap_or_else(|| id.to_string());
+    let money = |v: Option<f64>| v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".into());
+    if format == "text" {
+        let mut out = format!("【Hawwwker 比价】{}\n", d.summary.instruction);
+        if let Some(ai) = &d.ai_summary {
+            out.push_str(&format!("结论：{}\n", ai.headline));
+        }
+        out.push_str(&format!("（到手价已换算为 {}，含运费与券后价）\n\n", s.display_currency));
+        for (i, r) in items.iter().take(15).enumerate() {
+            out.push_str(&format!(
+                "{}. {} | {} | 到手 {} {} | 标价 {} {} | {}\n   {}\n",
+                i + 1,
+                pname(&r.platform_id),
+                r.title.chars().take(50).collect::<String>(),
+                s.display_currency,
+                money(r.display_landed.or(r.display_price)),
+                r.currency,
+                money(r.price),
+                r.deal.as_ref().map(|x| x.label.clone()).unwrap_or_default(),
+                r.url
+            ));
+        }
+        return Ok(out);
+    }
+    let dir = state.data_dir.join("exports");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("search-{}.csv", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+    let mut out = String::from("\u{feff}排名,平台,标题,标价,币种,运费,券后价,到手价,到手价(显示币种),匹配,匹配分,价格判断,店铺,链接\n");
+    for r in items {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            r.rank,
+            csv_escape(&pname(&r.platform_id)),
+            csv_escape(&r.title),
+            money(r.price),
+            r.currency,
+            money(r.shipping),
+            money(r.coupon_price),
+            money(r.landed_price),
+            money(r.display_landed),
+            r.match_info.verdict,
+            r.match_info.score,
+            r.deal.as_ref().map(|x| x.label.clone()).unwrap_or_default(),
+            csv_escape(r.shop.as_deref().unwrap_or("")),
+            csv_escape(&r.url)
+        ));
+    }
+    std::fs::write(&path, out)?;
+    let _ = app.opener().reveal_item_in_dir(&path);
+    Ok(path.display().to_string())
+}
+
+/// 检测本机 AI 服务（Ollama / LM Studio），用于零成本上手。
+#[tauri::command]
+pub async fn ai_detect_local() -> LocalAi {
+    let client = match reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_millis(1500)).build() {
+        Ok(c) => c,
+        Err(_) => return LocalAi::default(),
+    };
+    if let Ok(r) = client.get("http://127.0.0.1:11434/api/tags").send().await {
+        if let Ok(v) = r.json::<Value>().await {
+            let models: Vec<String> = v["models"].as_array().map(|a| a.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect()).unwrap_or_default();
+            return LocalAi { found: true, base_url: "http://localhost:11434/v1".into(), models };
+        }
+    }
+    if let Ok(r) = client.get("http://127.0.0.1:1234/v1/models").send().await {
+        if let Ok(v) = r.json::<Value>().await {
+            let models: Vec<String> = v["data"].as_array().map(|a| a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect()).unwrap_or_default();
+            return LocalAi { found: true, base_url: "http://localhost:1234/v1".into(), models };
+        }
+    }
+    LocalAi::default()
+}
+
+/// 按所在地区推荐平台（引导第 4 步）。
+#[tauri::command]
+pub fn platforms_recommend(timezone: String, language: String) -> Recommendation {
+    let tz = timezone.to_lowercase();
+    let cn_core = ["taobao", "jd", "pinduoduo", "xianyu"];
+    let (region, mut ids, reason): (&str, Vec<&str>, &str) = if tz.starts_with("asia/shanghai") || tz.starts_with("asia/chongqing") || tz.starts_with("asia/urumqi") {
+        ("cn", vec!["taobao", "jd", "pinduoduo", "xianyu", "xiaohongshu", "douyin"], "你在中国大陆：推荐国内主流电商与种草平台")
+    } else if tz.starts_with("europe/berlin") || tz.starts_with("europe/vienna") || tz.starts_with("europe/zurich") {
+        ("all", vec!["amazon_de", "ebay_de", "idealo", "kleinanzeigen"], "你在德语区：推荐 Amazon.de、eBay.de、idealo 比价与 Kleinanzeigen 二手，并保留国内平台")
+    } else if tz.starts_with("europe/paris") {
+        ("all", vec!["amazon_fr", "aliexpress", "temu"], "你在法国：推荐 Amazon.fr 与跨境平台，并保留国内平台")
+    } else if tz.starts_with("europe/london") {
+        ("all", vec!["amazon_co_uk", "ebay_co_uk", "aliexpress"], "你在英国：推荐 Amazon.co.uk、eBay.co.uk，并保留国内平台")
+    } else if tz.starts_with("asia/tokyo") {
+        ("all", vec!["amazon_co_jp", "rakuten", "mercari_jp"], "你在日本：推荐 Amazon.co.jp、乐天与 Mercari，并保留国内平台")
+    } else if tz.starts_with("america/") {
+        ("all", vec!["amazon_com", "ebay_com", "walmart", "bestbuy"], "你在美洲：推荐 Amazon.com、eBay、Walmart、Best Buy，并保留国内平台")
+    } else if tz.starts_with("europe/") {
+        ("all", vec!["amazon_de", "ebay_de", "aliexpress", "temu"], "你在欧洲：推荐欧洲站点与跨境平台，并保留国内平台")
+    } else {
+        ("all", vec!["amazon_com", "aliexpress", "temu"], "推荐通用国际站点，并保留国内平台")
+    };
+    if region != "cn" && language.to_lowercase().starts_with("zh") {
+        ids.extend(cn_core);
+    }
+    Recommendation { region: region.into(), ids: ids.into_iter().map(String::from).collect(), reason: reason.into() }
+}
+
+/// 平台自检：在真实网络上做一次小搜索，看能否识别结果与价格。
+#[tauri::command]
+pub async fn platform_selftest(state: S<'_>, ids: Vec<String>, query: Option<String>) -> AppResult<Vec<SelfTestResult>> {
+    let st = state.inner().clone();
+    let all = platforms::all(&st.db);
+    let mut out = vec![];
+    for id in ids.iter().take(12) {
+        let Some(p) = all.iter().find(|p| &p.id == id) else { continue };
+        out.push(crate::selftest::run_one(&st.browser, p, query.as_deref()).await);
+    }
+    Ok(out)
 }

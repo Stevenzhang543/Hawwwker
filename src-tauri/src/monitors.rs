@@ -129,7 +129,7 @@ pub fn run(state: &AppState, app: Option<AppHandle>, id: i64) -> AppResult<Strin
         let link = format!("/discover/history?run={run_id}");
         if !ok {
             if outcome.status != "cancelled" {
-                crate::notify::push(&app, &st.db, "error", "warning", &format!("监控「{}」本次运行失败", m.name), outcome.error.as_deref().unwrap_or(""), &link).await;
+                crate::notify::push(&app, &st.db, "error", "warning", &format!("监控「{}」本次运行失败", m.name), outcome.error.as_deref().unwrap_or(""), &link, "").await;
             }
             return;
         }
@@ -138,13 +138,13 @@ pub fn run(state: &AppState, app: Option<AppHandle>, id: i64) -> AppResult<Strin
         let prev_in_m = m.best_price;
         if let (Some(t), Some(best)) = (m.target_price, best_in_m) {
             if best <= t && prev_in_m.is_none_or(|prev| best < prev) {
-                crate::notify::push(&app, &st.db, "target_hit", "success", &format!("「{}」出现目标价以内的商品", m.name), &format!("最低 {} {:.2}（目标 {:.2}）", outcome.currency, best, t), &link).await;
+                crate::notify::push(&app, &st.db, "target_hit", "success", &format!("「{}」出现目标价以内的商品", m.name), &format!("最低 {} {:.2}（目标 {:.2}）", outcome.currency, best, t), &link, "").await;
                 return;
             }
         }
         if !first_run && !fresh.is_empty() {
             let body = fresh.iter().take(3).map(|r| format!("· {}", r.title.chars().take(36).collect::<String>())).collect::<Vec<_>>().join("\n");
-            crate::notify::push(&app, &st.db, "new_items", "info", &format!("「{}」发现 {} 个新商品", m.name, fresh.len()), &body, &link).await;
+            crate::notify::push(&app, &st.db, "new_items", "info", &format!("「{}」发现 {} 个新商品", m.name, fresh.len()), &body, &link, "").await;
         }
     });
     Ok(run_id)

@@ -2,8 +2,9 @@
 import { nextTick, onMounted, ref, watch } from "vue";
 import Icon from "@/components/ui/Icon.vue";
 
-const props = defineProps<{ modelValue: string; busy?: boolean; compact?: boolean; placeholder?: string }>();
-const emit = defineEmits<{ "update:modelValue": [string]; run: [] }>();
+/** link = 输入的是商品链接：按钮变成"识别链接" */
+const props = defineProps<{ modelValue: string; busy?: boolean; compact?: boolean; placeholder?: string; link?: boolean }>();
+const emit = defineEmits<{ "update:modelValue": [string]; run: []; escape: []; blur: [] }>();
 const ta = ref<HTMLTextAreaElement | null>(null);
 const focused = ref(false);
 
@@ -20,6 +21,8 @@ function onKey(e: KeyboardEvent) {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey || !e.shiftKey) && !e.isComposing) {
     e.preventDefault();
     emit("run");
+  } else if (e.key === "Escape") {
+    emit("escape");
   }
 }
 defineExpose({ focus: () => ta.value?.focus() });
@@ -27,24 +30,24 @@ defineExpose({ focus: () => ta.value?.focus() });
 
 <template>
   <div v-spec class="cbox glass-2" :class="{ focused, compact, busy }">
-    <span class="ai-badge" title="AI 规划 + 校验"><Icon name="spark" :size="18" /></span>
+    <span class="ai-badge" :class="{ link }" :title="link ? '识别到商品链接' : 'AI 规划 + 校验'"><Icon :name="link ? 'link' : 'spark'" :size="18" /></span>
     <textarea
       ref="ta"
       class="cbox-input"
       rows="1"
       :value="modelValue"
-      :placeholder="placeholder ?? '一句话说出你想找的东西：品牌型号、预算、平台、成色……'"
+      :placeholder="placeholder ?? '一句话说出想找的东西（品牌型号、预算、平台、成色），或粘贴商品链接找同款比价'"
       @input="emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)"
       @keydown="onKey"
       @focus="focused = true"
-      @blur="focused = false"
+      @blur="focused = false; emit('blur')"
     ></textarea>
     <div class="cbox-right">
       <kbd v-if="!compact" class="hint">Enter</kbd>
       <button v-ripple v-magnet="0.2" class="run-btn" :disabled="busy || !modelValue.trim()" @click="emit('run')">
         <Icon v-if="busy" name="refresh" :size="17" class="spin" />
-        <Icon v-else name="arrow" :size="18" :stroke="2.2" />
-        <span>{{ busy ? "处理中" : "搜索" }}</span>
+        <Icon v-else :name="link ? 'scale' : 'arrow'" :size="18" :stroke="2.2" />
+        <span>{{ busy ? "处理中" : link ? "找同款" : "搜索" }}</span>
       </button>
     </div>
   </div>
@@ -89,6 +92,10 @@ defineExpose({ focus: () => ta.value?.focus() });
   color: #fff;
   box-shadow: 0 6px 16px rgba(80, 100, 255, 0.35);
   margin-top: 2px;
+}
+.ai-badge.link {
+  background: linear-gradient(135deg, #2fd27a, #1aa85c);
+  box-shadow: 0 6px 16px rgba(30, 170, 92, 0.35);
 }
 .cbox-input {
   flex: 1;

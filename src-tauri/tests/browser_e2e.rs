@@ -89,6 +89,8 @@ async fn search_login_probe_cookies() {
         println!("{:<55} {:?} {} orig={:?} rating={:?} ad={} cond={}", c.title, c.price, c.currency, c.original_price, c.rating, c.is_ad, c.condition);
     }
     assert_eq!(cands.len(), 3);
+    let want = if std::env::var("HAWWWKER_CDP").as_deref() == Ok("port") { "port" } else { "pipe" };
+    assert_eq!(browser.transport(), want, "CDP transport");
     let main = cands.iter().find(|c| c.external_id == "B09Y2MYL5C").unwrap();
     assert!(main.title.contains("WH-1000XM5"), "title: {}", main.title);
     assert_eq!(main.price, Some(289.99));

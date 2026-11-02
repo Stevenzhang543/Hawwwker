@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
-import { useRoute } from "vue-router";
-import { findNav } from "@/nav";
 import { useAppStore } from "@/stores/app";
 import { useUiStore } from "@/stores/ui";
 import { useSearchStore } from "@/stores/search";
 import { useNoticeStore } from "@/stores/notices";
 import Icon from "@/components/ui/Icon.vue";
 import NotificationPopover from "./NotificationPopover.vue";
+import PageTabs from "./PageTabs.vue";
 
 const props = defineProps<{ elRef?: (el: HTMLElement | null) => void }>();
 const emit = defineEmits<{ goRun: [] }>();
@@ -16,11 +15,9 @@ const app = useAppStore();
 const ui = useUiStore();
 const search = useSearchStore();
 const notices = useNoticeStore();
-const route = useRoute();
 const root = ref<HTMLElement | null>(null);
 const bellOpen = ref(false);
 
-const crumb = computed(() => findNav(route.path));
 const running = computed(() => search.active[0] ?? null);
 const runningPct = computed(() => Math.round((running.value?.progress ?? 0) * 100));
 
@@ -30,16 +27,12 @@ onMounted(() => props.elRef?.(root.value));
 <template>
   <header ref="root" class="topbar">
     <div class="crumb">
-      <template v-if="crumb">
-        <span class="c1">{{ crumb.group.label }}</span>
-        <Icon name="chevron" :size="14" class="sep" />
-        <span class="c2">{{ crumb.item.label }}</span>
-      </template>
+      <PageTabs />
     </div>
 
-    <button v-ripple class="palette-trigger" @click="ui.paletteOpen = true">
+    <button v-ripple class="palette-trigger" title="搜索商品、输入指令或跳转（Ctrl K）" @click="ui.paletteOpen = true">
       <Icon name="search" :size="16" />
-      <span>搜索商品、输入指令或跳转…</span>
+      <span>搜索或跳转…</span>
       <kbd>Ctrl K</kbd>
     </button>
 
@@ -92,25 +85,14 @@ onMounted(() => props.elRef?.(root.value));
 .crumb {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 160px;
-  font-size: 13px;
-}
-.c1 {
-  color: var(--text-3);
-}
-.c2 {
-  font-weight: 650;
-  color: var(--text);
-  font-size: 14px;
-}
-.sep {
-  color: var(--text-3);
+  min-width: 0;
+  flex: 0 1 auto;
 }
 .palette-trigger {
-  flex: 1;
-  max-width: 460px;
-  margin: 0 auto;
+  flex: 1 1 160px;
+  min-width: 44px;
+  max-width: 340px;
+  margin: 0 0 0 auto;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -133,13 +115,29 @@ onMounted(() => props.elRef?.(root.value));
   flex: 1;
   text-align: left;
   font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 1240px) {
+  .palette-trigger {
+    flex: 0 0 auto;
+    width: 36px;
+    min-width: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+  .palette-trigger span,
+  .palette-trigger kbd {
+    display: none;
+  }
 }
 .actions {
   display: flex;
   align-items: center;
   gap: 4px;
-  min-width: 160px;
   justify-content: flex-end;
+  flex: none;
 }
 .run-pill {
   display: flex;

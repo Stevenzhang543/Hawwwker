@@ -17,8 +17,9 @@ fn norm(s: &str) -> String {
 }
 
 /// 候选价格换算到计划币种。
+/// 候选的到手价（券后 + 运费）换算到指定币种；预算、排序都按到手价比较。
 pub fn price_in(c: &Candidate, currency: &str, fx: &Fx) -> Option<f64> {
-    c.price.and_then(|p| fx.convert(p, &c.currency, currency))
+    c.landed().and_then(|p| fx.convert(p, &c.currency, currency))
 }
 
 fn excluded(c: &Candidate, plan: &SearchPlan) -> bool {

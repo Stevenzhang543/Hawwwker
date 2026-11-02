@@ -14,7 +14,7 @@ export const ROLE_HOME: Record<Role, string> = {
 export const useAppStore = defineStore("app", () => {
   const ready = ref(false);
   const bootError = ref<string | null>(null);
-  const version = ref("26.01");
+  const version = ref("26.02");
   const dataDir = ref("");
   const settings = ref<AppSettings | null>(null);
   const ai = ref<AiStatus>({ configured: false, verified: false, model: "", provider: "" });

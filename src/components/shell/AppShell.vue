@@ -9,6 +9,7 @@ import { useUiStore } from "@/stores/ui";
 import { usePlatformStore } from "@/stores/platforms";
 import { money } from "@/utils/format";
 import { useAppStore } from "@/stores/app";
+import { findGroup } from "@/nav";
 
 const scroller = ref<HTMLElement | null>(null);
 const topbarEl = ref<HTMLElement | null>(null);
@@ -27,6 +28,15 @@ watch(
     scroller.value?.scrollTo({ top: 0, behavior: "instant" });
     topbarEl.value?.style.setProperty("--sb", "0");
   },
+);
+// 记住每个一级入口最近的标签页（不含 query，避免重新打开详情抽屉）
+watch(
+  () => route.path,
+  (p) => {
+    const g = findGroup(p);
+    if (g) ui.lastTab = { ...ui.lastTab, [g.key]: p };
+  },
+  { immediate: true },
 );
 
 // 不在搜索页时完成检索：灵动岛提示

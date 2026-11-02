@@ -2,7 +2,7 @@
 import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api, toAppError } from "@/api";
-import type { FxRates } from "@/api/types";
+import type { BrowserInfo, FxRates } from "@/api/types";
 import { useAppStore } from "@/stores/app";
 import { useUiStore } from "@/stores/ui";
 import { CURRENCIES } from "@/utils/format";
@@ -12,14 +12,19 @@ const app = useAppStore();
 const ui = useUiStore();
 const router = useRouter();
 const fx = ref<FxRates | null>(app.fx);
+const browser = ref<BrowserInfo | null>(null);
 
 onMounted(async () => {
-  try {
-    fx.value = await api.fxRates();
-  } catch {
-    /* ignore */
-  }
+  const [f, b] = await Promise.allSettled([api.fxRates(), api.browserInfo()]);
+  if (f.status === "fulfilled") fx.value = f.value;
+  if (b.status === "fulfilled") browser.value = b.value;
 });
+/** 汇率来源：ECB → 备用源 → 内置表 */
+const FX_SOURCE: Record<string, [string, string]> = {
+  ecb: ["ECB 参考汇率", "green"],
+  "er-api": ["open.er-api.com（备用源）", "blue"],
+  builtin: ["内置参考表（离线）", "orange"],
+};
 
 async function openDir() {
   try {
@@ -75,8 +80,10 @@ function rate(code: string): string {
     <section class="glass card">
       <div class="card-head">
         <h3>汇率</h3>
-        <span class="chip" :class="fx?.source === 'ecb' ? 'green' : 'orange'">{{ fx?.source === "ecb" ? "ECB 参考汇率" : "内置参考表（离线）" }}</span>
-        <span class="faint tiny">{{ fx?.date }}</span>
+        <span class="chip" :class="(FX_SOURCE[fx?.source ?? 'builtin'] ?? FX_SOURCE.builtin)![1]">{{ (FX_SOURCE[fx?.source ?? "builtin"] ?? [fx?.source ?? "—"])[0] }}</span>
+        <span class="faint tiny">{{ fx?.date === "builtin" ? "" : fx?.date }}</span>
+        <span class="spacer"></span>
+        <span class="faint tiny">每 12 小时自动更新；主源不可用时自动切换备用源</span>
       </div>
       <div class="fx">
         <div v-for="c in CURRENCIES.filter((x) => x.code !== app.displayCurrency)" :key="c.code" class="fx-i">
@@ -88,9 +95,16 @@ function rate(code: string): string {
     </section>
 
     <section class="glass card">
-      <div class="card-head"><h3>登录会话</h3></div>
+      <div class="card-head">
+        <h3>浏览器与登录会话</h3>
+        <span v-if="browser?.transport" class="chip" :class="browser.transport === 'port' ? 'orange' : 'green'">
+          <Icon :name="browser.transport === 'port' ? 'warn' : 'shield'" />{{ browser.transport === "port" ? "本地端口（回退模式）" : "管道通信 · 不开放端口" }}
+        </span>
+      </div>
       <div class="row">
-        <span class="muted small">登录会话保存在本机浏览器目录。需要清除时请到「账号与登录」逐个退出或一键清除。</span>
+        <span class="muted small">
+          登录会话保存在本机浏览器目录。{{ browser?.transport === "port" ? "管道启动失败，已回退为只监听本机的随机端口控制自动化浏览器。" : "通过进程管道控制自动化浏览器，不开放任何端口，本机其他程序无法接入。" }}需要清除时请到「账号与登录」逐个退出或一键清除。
+        </span>
         <span class="spacer"></span>
         <button class="btn" @click="router.push('/platforms/accounts')"><Icon name="key" />账号与登录</button>
       </div>

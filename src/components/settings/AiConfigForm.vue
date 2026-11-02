@@ -2,12 +2,12 @@
 /* AI 连接表单：预设 → 协议 / 地址 / Key（只写）/ 模型 → 保存并测试。引导与设置页共用。 */
 import { computed, onMounted, ref } from "vue";
 import { api, openExternal, toAppError } from "@/api";
-import type { AiConfig, AiPreset, AiProtocol, AiStatus } from "@/api/types";
+import type { AiConfig, AiPreset, AiProtocol, AiStatus, LocalAi } from "@/api/types";
 import { useAppStore } from "@/stores/app";
 import GSegmented from "@/components/ui/GSegmented.vue";
 import Icon from "@/components/ui/Icon.vue";
 
-const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: false });
+const props = withDefaults(defineProps<{ compact?: boolean; autoDetect?: boolean }>(), { compact: false, autoDetect: false });
 const emit = defineEmits<{ verified: [AiStatus] }>();
 const app = useAppStore();
 const presets = ref<AiPreset[]>([]);
@@ -23,6 +23,33 @@ const timeoutSecs = ref(60);
 const testing = ref(false);
 const status = ref<AiStatus | null>(null);
 const showAdv = ref(false);
+/* 本机模型（Ollama / LM Studio）：零成本上手 */
+const local = ref<LocalAi | null>(null);
+const localModel = ref("");
+const detecting = ref(false);
+async function detect() {
+  detecting.value = true;
+  try {
+    local.value = await api.aiDetectLocal();
+    localModel.value = local.value.models[0] ?? "";
+  } catch {
+    local.value = { found: false, baseUrl: "", models: [] };
+  } finally {
+    detecting.value = false;
+  }
+}
+const localName = computed(() => (local.value?.baseUrl.includes(":1234") ? "LM Studio" : "Ollama"));
+async function useLocal() {
+  if (!local.value?.found) return;
+  const isOllama = local.value.baseUrl.includes(":11434");
+  provider.value = isOllama ? "ollama" : "custom";
+  protocol.value = "openai";
+  baseUrl.value = local.value.baseUrl;
+  model.value = localModel.value || local.value.models[0] || "";
+  fastModel.value = "";
+  showAdv.value = !isOllama;
+  await saveAndTest();
+}
 
 onMounted(async () => {
   try {
@@ -38,6 +65,7 @@ onMounted(async () => {
     timeoutSecs.value = c.timeoutSecs;
     if (!c.baseUrl) pick(p.find((x) => x.id === "deepseek") ?? p[0]);
     if (app.ai.verified) status.value = app.ai;
+    if (props.autoDetect && !app.ai.verified) void detect();
   } catch (e) {
     status.value = { configured: false, verified: false, model: "", provider: "", lastError: toAppError(e).message };
   }
@@ -90,6 +118,19 @@ const REGION: Record<string, string> = { cn: "国内", intl: "国际", local: "�
 
 <template>
   <div class="aif" :class="{ compact: props.compact }">
+    <Transition name="blur">
+      <div v-if="local?.found" class="local">
+        <span class="l-ico"><Icon name="cpu" :size="18" /></span>
+        <div class="l-text">
+          <b>发现本机 {{ localName }}</b>
+          <small>{{ local.models.length ? `${local.models.length} 个模型 · 免费、数据不出本机` : "没有读到模型列表，可在下方手动填写模型名" }}</small>
+        </div>
+        <select v-if="local.models.length > 1" v-model="localModel" class="select sm" style="width: 160px" aria-label="本机模型">
+          <option v-for="m in local.models" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <button v-ripple class="btn primary sm" :disabled="testing" @click="useLocal"><Icon name="zap" />使用本机模型（免费）</button>
+      </div>
+    </Transition>
     <div class="presets">
       <button v-for="p in presets" :key="p.id" v-ripple class="preset" :class="{ on: provider === p.id }" @click="pick(p)">
         <span class="p-name">{{ p.name }}</span>
@@ -140,6 +181,10 @@ const REGION: Record<string, string> = { cn: "国内", intl: "国际", local: "�
 
     <div class="row" style="margin-top: 14px">
       <button v-if="provider !== 'custom'" class="btn ghost sm" @click="showAdv = !showAdv"><Icon :name="showAdv ? 'up' : 'sliders'" />{{ showAdv ? "收起高级选项" : "高级选项" }}</button>
+      <button v-if="!local?.found" class="btn ghost sm" :disabled="detecting" title="检测 Ollama（11434 端口）与 LM Studio（1234 端口）" @click="detect">
+        <Icon :name="detecting ? 'refresh' : 'cpu'" :class="{ spin: detecting }" />{{ detecting ? "检测中…" : "检测本机模型（Ollama / LM Studio）" }}
+      </button>
+      <span v-if="local && !local.found && !detecting" class="faint tiny">本机没有发现 Ollama / LM Studio</span>
       <span class="spacer"></span>
       <button v-ripple class="btn primary" :disabled="testing || !model || !baseUrl" @click="saveAndTest">
         <Icon :name="testing ? 'refresh' : 'zap'" :class="{ spin: testing }" />{{ testing ? "正在连接模型…" : "保存并测试连接" }}
@@ -166,6 +211,37 @@ const REGION: Record<string, string> = { cn: "国内", intl: "国际", local: "�
 </template>
 
 <style scoped>
+.local {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--ok-bg);
+  border: 1px solid color-mix(in srgb, var(--ok) 30%, transparent);
+}
+.l-ico {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  background: var(--ok);
+  color: #fff;
+}
+.l-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+.l-text small {
+  font-size: 11.5px;
+  color: var(--text-2);
+}
 .presets {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

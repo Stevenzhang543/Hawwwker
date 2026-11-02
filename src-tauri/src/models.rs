@@ -246,6 +246,8 @@ pub struct BrowserInfo {
     pub executable: Option<String>,
     pub running: bool,
     pub profile_dir: String,
+    /// pipe = 管道通信（不开端口）；port = 回退的本地端口
+    pub transport: String,
 }
 
 /* ------------------------------------------------------------------ 搜索 */
@@ -374,6 +376,21 @@ pub struct AlsoOn {
     pub url: String,
 }
 
+/// 价格判断：当前价相对本机记录的历史价格处于什么位置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DealInfo {
+    /// lowest = 历史最低 · low = 近期低位 · normal = 正常 · high = 偏高 · new = 数据积累中
+    pub level: String,
+    pub label: String,
+    pub basis: String,
+    pub low: Option<f64>,
+    pub median: Option<f64>,
+    pub high: Option<f64>,
+    pub points: u32,
+    pub days: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultItem {
@@ -387,6 +404,19 @@ pub struct ResultItem {
     pub currency: String,
     pub display_price: Option<f64>,
     pub original_price: Option<f64>,
+    /// 运费（0 = 包邮），与 price 同币种
+    pub shipping: Option<f64>,
+    /// 券后 / 满减后价
+    pub coupon_price: Option<f64>,
+    /// 到手价 =（券后价或标价）+ 运费
+    pub landed_price: Option<f64>,
+    /// 到手价换算到显示币种
+    pub display_landed: Option<f64>,
+    pub deal: Option<DealInfo>,
+    /// true = 渐进式结果（规则初判，AI 核对中）
+    pub provisional: bool,
+    /// 用户反馈：irrelevant = 标记为不相关
+    pub feedback: Option<String>,
     pub sales: Option<i64>,
     pub rating: Option<f64>,
     pub reviews: Option<i64>,
@@ -450,6 +480,12 @@ pub enum RunEventBody {
     },
     Filter { fetched: u32, kept: u32, dropped: BTreeMap<String, u32>, duplicates: u32 },
     Verify { checked: u32, matched: u32, hidden: u32 },
+    /// 渐进式结果：某个平台搜完立即推送（规则初判）
+    Partial {
+        #[serde(rename = "platformId")]
+        platform_id: String,
+        items: Vec<ResultItem>,
+    },
     Results { items: Vec<ResultItem> },
     Summary { summary: AiSummary },
     Log { level: String, message: String },
@@ -502,6 +538,7 @@ pub struct PricePoint {
 #[serde(rename_all = "camelCase")]
 pub struct ListingDetail {
     pub item: ResultItem,
+    pub deal: Option<DealInfo>,
     pub history: Vec<PricePoint>,
     pub also_on: Vec<AlsoOn>,
     pub watch_id: Option<i64>,
@@ -540,6 +577,9 @@ pub struct WatchItem {
     pub note: String,
     pub created_at: String,
     pub spark: Vec<f64>,
+    /// 商户：我的售价（与追踪的竞品当前价对比）
+    pub my_price: Option<f64>,
+    pub deal: Option<DealInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -564,6 +604,8 @@ pub struct WatchPatch {
     pub enabled: Option<bool>,
     pub note: Option<String>,
     pub title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub my_price: Option<Option<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,6 +658,8 @@ pub struct Notice {
     pub title: String,
     pub body: String,
     pub link: String,
+    /// 外部链接（例如到价提醒的商品页，"去购买"）
+    pub url: String,
     pub read: bool,
     pub created_at: String,
 }
@@ -782,6 +826,64 @@ pub struct InsightDone {
     pub report_id: String,
     pub text: String,
     pub error: Option<String>,
+}
+
+/* ------------------------------------------------------------------ v26.02 新增 */
+/// 粘贴的商品链接识别结果
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkInfo {
+    pub url: String,
+    pub platform_id: Option<String>,
+    pub platform_name: Option<String>,
+    pub title: Option<String>,
+    pub price: Option<f64>,
+    pub currency: Option<String>,
+    pub image: Option<String>,
+    /// 建议的"全网找同款"搜索指令
+    pub instruction: String,
+    /// 是否已在追踪
+    pub watch_id: Option<i64>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAi {
+    pub found: bool,
+    pub base_url: String,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recommendation {
+    pub region: String,
+    pub ids: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfTestSample {
+    pub title: String,
+    pub price: Option<f64>,
+    pub currency: String,
+    pub landed: Option<f64>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfTestResult {
+    pub platform_id: String,
+    pub ok: bool,
+    pub count: u32,
+    pub with_price: u32,
+    pub samples: Vec<SelfTestSample>,
+    pub ms: u64,
+    pub login_required: bool,
+    pub message: Option<String>,
 }
 
 /* ------------------------------------------------------------------ 杂项 */

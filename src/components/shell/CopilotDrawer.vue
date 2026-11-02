@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { useUiStore } from "@/stores/ui";
 import { useCopilotStore } from "@/stores/copilot";
 import { useSearchStore } from "@/stores/search";
@@ -8,6 +8,8 @@ import { useWatchStore } from "@/stores/watch";
 import { useAppStore } from "@/stores/app";
 import { openExternal, toAppError } from "@/api";
 import type { CopilotAction } from "@/api/types";
+import { findNav } from "@/nav";
+import type { CopilotContextChip } from "@/stores/copilot";
 import { handleMdClick, renderMarkdown, stripActions } from "@/utils/markdown";
 import Icon from "@/components/ui/Icon.vue";
 
@@ -17,7 +19,9 @@ const search = useSearchStore();
 const watchStore = useWatchStore();
 const app = useAppStore();
 const router = useRouter();
+const route = useRoute();
 const text = ref("");
+const skillMenu = ref(false);
 const listEl = ref<HTMLElement | null>(null);
 const inputEl = ref<HTMLTextAreaElement | null>(null);
 let release: (() => void) | null = null;
@@ -45,6 +49,44 @@ watch(() => [cp.messages.length, cp.streaming?.text.length], scroll);
 
 const streamingHtml = computed(() => (cp.streaming ? renderMarkdown(stripActions(cp.streaming.text)) : ""));
 const activeSkill = computed(() => cp.skills.find((s) => s.id === cp.skill) ?? null);
+/** 技能：3 个常用（按角色排序）直接显示，其余收进「技能」下拉 */
+const topSkills = computed(() => cp.sortedSkills.slice(0, 3));
+const moreSkills = computed(() => cp.sortedSkills.slice(3));
+const moreActive = computed(() => moreSkills.value.find((s) => s.id === cp.skill) ?? null);
+
+/** 可附加的页面上下文：只有附加后 Copilot 才能看到（不会自动上传页面内容） */
+const here = computed(() => findNav(route.path));
+const suggestion = computed<CopilotContextChip | null>(() => {
+  if (cp.context) return null;
+  const run = search.current;
+  if (route.path.startsWith("/discover/search") && run && run.results.length) {
+    const top = run.results.filter((r) => r.match.verdict !== "mismatch").slice(0, 12);
+    return {
+      label: `当前搜索：${run.instruction.length > 14 ? run.instruction.slice(0, 14) + "…" : run.instruction}`,
+      data: {
+        kind: "search",
+        instruction: run.instruction,
+        results: top.map((r) => ({ id: r.id, title: r.title, platformId: r.platformId, price: r.price, currency: r.currency, landedPrice: r.landedPrice ?? null, deal: r.deal?.label ?? null, verdict: r.match.verdict, url: r.url })),
+      },
+    };
+  }
+  if (route.path.startsWith("/track/watchlist") && watchStore.items.length) {
+    return {
+      label: `我的追踪清单（${watchStore.items.length} 件）`,
+      data: {
+        kind: "watchlist",
+        items: watchStore.items.slice(0, 30).map((w) => ({ id: w.listingId, watchId: w.id, title: w.title, platformId: w.platformId, lastPrice: w.lastPrice, currency: w.currency, targetPrice: w.targetPrice, lowest: w.lowest, highest: w.highest, changePct: w.changePct, deal: w.deal?.label ?? null, myPrice: w.myPrice ?? null })),
+      },
+    };
+  }
+  if (route.path.startsWith("/track/monitors") && watchStore.monitors.length) {
+    return {
+      label: `我的监控（${watchStore.monitors.length} 个）`,
+      data: { kind: "monitors", items: watchStore.monitors.map((m) => ({ name: m.name, instruction: m.instruction, bestPrice: m.bestPrice, currency: m.currency, targetPrice: m.targetPrice, runCount: m.runCount })) },
+    };
+  }
+  return null;
+});
 
 function send() {
   const t = text.value.trim();
@@ -59,6 +101,7 @@ function onKey(e: KeyboardEvent) {
   }
 }
 function pickSkill(id: string) {
+  skillMenu.value = false;
   cp.skill = cp.skill === id ? null : id;
   const s = cp.skills.find((x) => x.id === id);
   if (cp.skill && s && !text.value) text.value = s.starter;
@@ -104,9 +147,23 @@ async function reset() {
       </header>
 
       <div class="skills">
-        <button v-for="s in cp.sortedSkills" :key="s.id" v-ripple class="skill" :class="{ on: cp.skill === s.id }" :title="s.description" @click="pickSkill(s.id)">
+        <button v-for="s in topSkills" :key="s.id" v-ripple class="skill" :class="{ on: cp.skill === s.id }" :title="s.description" @click="pickSkill(s.id)">
           <Icon :name="s.icon" :size="15" />{{ s.name }}
         </button>
+        <div v-if="moreSkills.length" class="more" @mouseleave="skillMenu = false">
+          <button v-ripple class="skill" :class="{ on: !!moreActive }" :aria-expanded="skillMenu" @click="skillMenu = !skillMenu">
+            <Icon :name="moreActive?.icon ?? 'grid'" :size="15" />{{ moreActive?.name ?? `技能 ${moreSkills.length}` }}<Icon name="down" :size="13" />
+          </button>
+          <Transition name="pop">
+            <div v-if="skillMenu" class="skill-menu glass-3">
+              <button v-for="s in moreSkills" :key="s.id" class="sm-item" :class="{ on: cp.skill === s.id }" @click="pickSkill(s.id)">
+                <Icon :name="s.icon" :size="16" />
+                <span><b>{{ s.name }}</b><small>{{ s.description }}</small></span>
+                <Icon v-if="cp.skill === s.id" name="check" :size="14" class="ok" />
+              </button>
+            </div>
+          </Transition>
+        </div>
       </div>
 
       <div ref="listEl" class="msgs" @click="handleMdClick">
@@ -145,9 +202,12 @@ async function reset() {
       </div>
 
       <footer class="composer">
-        <div v-if="cp.context || activeSkill" class="ctx">
-          <span v-if="activeSkill" class="chip purple"><Icon :name="activeSkill.icon" />{{ activeSkill.name }}<button class="x" @click="cp.skill = null"><Icon name="x" :size="11" /></button></span>
-          <span v-if="cp.context" class="chip blue"><Icon name="tag" />{{ cp.context.label }}<button class="x" @click="cp.setContext(null)"><Icon name="x" :size="11" /></button></span>
+        <div class="ctx">
+          <span class="ctx-label" :title="`你在：${here ? here.group.label + ' · ' + here.item.label : '—'}。Copilot 只看到你的输入、角色和下面附加的上下文。`"><Icon name="eye" :size="12" />Copilot 看到</span>
+          <span v-if="activeSkill" class="chip purple"><Icon :name="activeSkill.icon" />{{ activeSkill.name }}<button class="x" title="取消技能" @click="cp.skill = null"><Icon name="x" :size="11" /></button></span>
+          <span v-if="cp.context" class="chip blue"><Icon name="tag" />{{ cp.context.label }}<button class="x" title="移除上下文" @click="cp.setContext(null)"><Icon name="x" :size="11" /></button></span>
+          <button v-else-if="suggestion" class="chip outline click" title="附加后 Copilot 才能看到这些内容" @click="cp.setContext(suggestion)"><Icon name="plus" />附上{{ suggestion.label }}</button>
+          <span v-if="!cp.context && !activeSkill && !suggestion" class="faint tiny">你的输入与角色（{{ { consumer: "消费者", merchant: "商户", analyst: "平台分析" }[app.role] }}）</span>
         </div>
         <div class="input-row">
           <textarea ref="inputEl" v-model="text" rows="2" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）" @keydown="onKey"></textarea>
@@ -225,6 +285,64 @@ async function reset() {
   cursor: pointer;
   white-space: nowrap;
   transition: transform var(--t-mid) var(--spring), background var(--t-fast);
+}
+.more {
+  position: relative;
+}
+.skill-menu {
+  position: absolute;
+  left: 0;
+  top: 36px;
+  width: 300px;
+  padding: 6px;
+  border-radius: 14px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+}
+.sm-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 10px;
+  border: none;
+  background: transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--text);
+}
+.sm-item:hover {
+  background: var(--hover);
+}
+.sm-item.on {
+  color: var(--brand-ink);
+}
+.sm-item span {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sm-item b {
+  font-size: 13px;
+}
+.sm-item small {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.35;
+}
+.sm-item .ok {
+  margin-top: 2px;
+}
+.ctx-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  margin-right: 2px;
 }
 .skill:active {
   transform: scale(0.94);

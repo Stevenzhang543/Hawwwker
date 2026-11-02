@@ -1,43 +1,40 @@
 <script setup lang="ts">
+/**
+ * 侧栏（v26.02）：只保留 5 个一级入口 + Copilot + 状态。二级页面在页面顶部以标签显示（PageTabs）。
+ * 点一级入口回到该入口最近访问的标签页。
+ */
 import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { NAV, type NavGroup } from "@/nav";
+import { NAV, findGroup, type NavGroup } from "@/nav";
 import { ROLE_HOME, ROLE_LABEL, useAppStore } from "@/stores/app";
 import { useUiStore } from "@/stores/ui";
-import { useSearchStore } from "@/stores/search";
-import { useNoticeStore } from "@/stores/notices";
-import { useWatchStore } from "@/stores/watch";
 import { useWindowWidth } from "@/composables/motion";
 import type { Role } from "@/api/types";
 import Icon from "@/components/ui/Icon.vue";
 import BrandMark from "./BrandMark.vue";
+import { groupBadge, useNavBadges } from "./navBadges";
 
 const app = useAppStore();
 const ui = useUiStore();
-const search = useSearchStore();
-const notices = useNoticeStore();
-const watch = useWatchStore();
 const route = useRoute();
 const router = useRouter();
 const width = useWindowWidth();
+const badgeOf = useNavBadges();
 
 const rail = computed(() => width.value < 1100 || !!app.settings?.sidebarCollapsed);
-const collapsed = ref<Record<string, boolean>>({});
 const roleOpen = ref(false);
-const flyout = ref<string | null>(null);
-let flyTimer = 0;
 
-const activeGroup = computed(() => NAV.find((g) => g.items.some((i) => route.path.startsWith(i.path)))?.key);
+const activeGroup = computed(() => findGroup(route.path)?.key);
+const badges = computed(() => Object.fromEntries(NAV.map((g) => [g.key, groupBadge(g, badgeOf)])) as Record<string, string | null>);
 
-function badge(path: string): string | null {
-  if (path === "/discover/search" && search.active.length) return "live";
-  if (path === "/track/alerts" && notices.unread) return String(notices.unread > 99 ? "99+" : notices.unread);
-  if (path === "/track/watchlist" && watch.hitTarget.length) return String(watch.hitTarget.length);
-  return null;
+function target(g: NavGroup): string {
+  const last = ui.lastTab[g.key];
+  return last && g.items.some((i) => last.startsWith(i.path)) ? last : g.items[0]?.path ?? "/";
 }
-
-function toggleGroup(g: NavGroup) {
-  collapsed.value = { ...collapsed.value, [g.key]: !collapsed.value[g.key] };
+function go(g: NavGroup) {
+  // 已在该入口内：再点一次回到第一个标签
+  const to = activeGroup.value === g.key ? g.items[0]?.path ?? "/" : target(g);
+  if (to !== route.fullPath) void router.push(to);
 }
 
 async function setRole(r: Role) {
@@ -50,14 +47,6 @@ async function setRole(r: Role) {
 
 function toggleRail() {
   void app.update({ sidebarCollapsed: !app.settings?.sidebarCollapsed });
-}
-
-function showFly(key: string) {
-  window.clearTimeout(flyTimer);
-  flyout.value = key;
-}
-function hideFly() {
-  flyTimer = window.setTimeout(() => (flyout.value = null), 160);
 }
 const roles: Role[] = ["consumer", "merchant", "analyst"];
 const roleIcon: Record<Role, string> = { consumer: "cart", merchant: "shop", analyst: "chart" };
@@ -95,48 +84,25 @@ const roleIcon: Record<Role, string> = { consumer: "cart", merchant: "shop", ana
     </div>
 
     <nav class="nav">
-      <div
+      <button
         v-for="(g, gi) in NAV"
         :key="g.key"
-        class="group"
-        :class="{ active: activeGroup === g.key, closed: collapsed[g.key] }"
-        @mouseenter="rail && showFly(g.key)"
-        @mouseleave="rail && hideFly()"
+        v-ripple
+        class="entry"
+        :class="{ on: activeGroup === g.key, rail }"
+        :title="rail ? `${g.label} · ${g.items.map((i) => i.label).join(' / ')}` : g.items.map((i) => i.label).join(' · ')"
+        @click="go(g)"
       >
-        <button v-if="!rail" class="group-head" @click="toggleGroup(g)">
-          <span>{{ g.label }}</span>
-          <small>{{ g.en }}</small>
+        <span class="e-ico"><Icon :name="g.icon" :size="rail ? 20 : 18" /></span>
+        <template v-if="!rail">
+          <span class="e-label">{{ g.label }}</span>
           <span class="spacer"></span>
-          <kbd class="alt">Alt {{ gi + 1 }}</kbd>
-          <Icon name="down" :size="13" class="chev" />
-        </button>
-        <router-link v-else :to="g.items[0]?.path ?? '/'" class="rail-btn" :class="{ on: activeGroup === g.key }" :title="g.label">
-          <Icon :name="g.icon" :size="20" />
-          <i v-if="g.items.some((i) => badge(i.path))" class="rail-dot"></i>
-        </router-link>
-
-        <div v-if="!rail" class="items">
-          <router-link v-for="it in g.items" :key="it.path" v-ripple :to="it.path" class="item" active-class="on">
-            <Icon :name="it.icon" :size="17" />
-            <span>{{ it.label }}</span>
-            <span class="spacer"></span>
-            <b v-if="badge(it.path) === 'live'" class="live"><i></i></b>
-            <b v-else-if="badge(it.path)" class="badge">{{ badge(it.path) }}</b>
-          </router-link>
-        </div>
-
-        <Transition name="pop">
-          <div v-if="rail && flyout === g.key" class="flyout glass-3" @mouseenter="showFly(g.key)" @mouseleave="hideFly">
-            <div class="fly-title">{{ g.label }}<small>{{ g.en }}</small></div>
-            <router-link v-for="it in g.items" :key="it.path" :to="it.path" class="item" active-class="on" @click="flyout = null">
-              <Icon :name="it.icon" :size="17" />
-              <span>{{ it.label }}</span>
-              <span class="spacer"></span>
-              <b v-if="badge(it.path) && badge(it.path) !== 'live'" class="badge">{{ badge(it.path) }}</b>
-            </router-link>
-          </div>
-        </Transition>
-      </div>
+          <b v-if="badges[g.key] === 'live'" class="live"><i></i></b>
+          <b v-else-if="badges[g.key]" class="badge">{{ badges[g.key] }}</b>
+          <kbd v-else class="alt">Alt {{ gi + 1 }}</kbd>
+        </template>
+        <i v-else-if="badges[g.key]" class="rail-dot"></i>
+      </button>
     </nav>
 
     <div class="sb-foot">
@@ -270,107 +236,80 @@ const roleIcon: Record<Role, string> = { consumer: "cart", merchant: "shop", ana
 .nav {
   flex: 1;
   overflow-y: auto;
-  overflow-x: visible;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 4px 0;
   margin: 0 -4px;
-  padding: 4px;
+  padding: 8px 4px;
 }
 .rail .nav {
   overflow: visible;
   align-items: center;
   gap: 6px;
 }
-.group {
+.entry {
   position: relative;
-}
-.group-head {
-  width: 100%;
   display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 6px 8px 3px;
+  align-items: center;
+  gap: 11px;
+  height: 42px;
+  padding: 0 10px 0 6px;
   border: none;
   background: transparent;
+  border-radius: 13px;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 580;
   cursor: pointer;
-  color: var(--text-3);
-  font-size: 12px;
+  text-align: left;
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-mid) var(--spring), box-shadow var(--t-mid);
+}
+.entry:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.entry:active {
+  transform: scale(0.97);
+}
+.entry.on {
+  color: var(--text);
+  background: var(--glass-2);
+  box-shadow: var(--shadow-1), inset 0 0 0 1px var(--line);
   font-weight: 650;
-  letter-spacing: 0.04em;
 }
-.group-head small {
-  font-size: 10.5px;
-  font-weight: 500;
-  opacity: 0.8;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+.e-ico {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  transition: background var(--t-mid), color var(--t-mid);
 }
-.group-head .alt {
+.entry.on .e-ico {
+  background: var(--brand-grad);
+  color: #fff;
+  box-shadow: 0 4px 12px rgba(80, 100, 255, 0.32);
+}
+.entry.rail {
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  justify-content: center;
+}
+.entry.rail .e-ico {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+}
+.entry .alt {
   opacity: 0;
   height: 16px;
   font-size: 10px;
   transition: opacity var(--t-fast);
 }
-.group-head:hover .alt {
+.entry:hover .alt {
   opacity: 1;
-}
-.group-head .chev {
-  align-self: center;
-  transition: transform var(--t-mid) var(--spring);
-}
-.group.closed .chev {
-  transform: rotate(-90deg);
-}
-.group.active .group-head {
-  color: var(--text-2);
-}
-.items {
-  display: grid;
-  grid-template-rows: 1fr;
-  transition: grid-template-rows 360ms var(--spring-soft), opacity 240ms;
-}
-.group.closed .items {
-  grid-template-rows: 0fr;
-  opacity: 0;
-  overflow: hidden;
-}
-.items > * {
-  min-height: 0;
-}
-.item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 34px;
-  padding: 0 10px;
-  margin: 1px 0;
-  border-radius: 11px;
-  color: var(--text-2);
-  font-size: 13.5px;
-  font-weight: 540;
-  transition: background var(--t-fast), color var(--t-fast), transform var(--t-mid) var(--spring);
-  overflow: hidden;
-}
-.items .item {
-  overflow: hidden;
-}
-.item:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-.item:active {
-  transform: scale(0.97);
-}
-.item.on {
-  color: var(--text);
-  background: var(--glass-2);
-  box-shadow: var(--shadow-1), inset 0 0 0 1px var(--line);
-  font-weight: 620;
-}
-.item.on :deep(.ico) {
-  color: var(--brand);
 }
 .badge {
   min-width: 20px;
@@ -405,57 +344,15 @@ const roleIcon: Record<Role, string> = { consumer: "cart", merchant: "shop", ana
     box-shadow: 0 0 0 0 rgba(255, 176, 32, 0);
   }
 }
-
-.rail-btn {
-  position: relative;
-  width: 44px;
-  height: 44px;
-  border-radius: 13px;
-  display: grid;
-  place-items: center;
-  color: var(--text-2);
-  transition: background var(--t-fast), color var(--t-fast), transform var(--t-mid) var(--spring);
-}
-.rail-btn:hover {
-  background: var(--hover);
-  color: var(--text);
-}
-.rail-btn.on {
-  background: var(--glass-2);
-  color: var(--brand);
-  box-shadow: var(--shadow-1);
-}
 .rail-dot {
   position: absolute;
-  top: 9px;
-  right: 9px;
-  width: 7px;
-  height: 7px;
+  top: 7px;
+  right: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--amber);
-}
-.flyout {
-  position: absolute;
-  left: 54px;
-  top: -6px;
-  width: 210px;
-  padding: 8px;
-  border-radius: 16px;
-  z-index: 60;
-}
-.fly-title {
-  padding: 4px 10px 8px;
-  font-weight: 650;
-  font-size: 13px;
-  display: flex;
-  gap: 6px;
-  align-items: baseline;
-}
-.fly-title small {
-  font-size: 10.5px;
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  box-shadow: 0 0 0 2px var(--bg-solid);
 }
 
 .sb-foot {

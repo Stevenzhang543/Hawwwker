@@ -14,7 +14,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 
 const COLS: &str = "id, listing_id, platform_id, title, url, image, currency, target_price, last_price, first_price, lowest, highest,
-    interval_minutes, enabled, status, last_error, last_checked_at, next_check_at, note, created_at";
+    interval_minutes, enabled, status, last_error, last_checked_at, next_check_at, note, created_at, my_price";
 
 fn row(r: &Row) -> rusqlite::Result<WatchItem> {
     let last: Option<f64> = r.get(8)?;
@@ -45,6 +45,8 @@ fn row(r: &Row) -> rusqlite::Result<WatchItem> {
         note: r.get(18)?,
         created_at: r.get(19)?,
         spark: vec![],
+        my_price: r.get(20)?,
+        deal: None,
     })
 }
 
@@ -56,6 +58,7 @@ pub fn get(db: &Db, id: i64) -> AppResult<WatchItem> {
         .ok_or_else(|| AppError::not_found("追踪项"))?;
     if let Some(l) = &w.listing_id {
         w.spark = spark(&c, l);
+        w.deal = w.last_price.and_then(|p| crate::deal::for_listing(&c, l, p, &w.currency));
     }
     Ok(w)
 }
@@ -67,6 +70,7 @@ pub fn list(db: &Db) -> AppResult<Vec<WatchItem>> {
     for w in items.iter_mut() {
         if let Some(l) = &w.listing_id {
             w.spark = spark(&c, l);
+            w.deal = w.last_price.and_then(|p| crate::deal::for_listing(&c, l, p, &w.currency));
         }
     }
     Ok(items)
@@ -142,6 +146,9 @@ pub fn update(db: &Db, id: i64, patch: WatchPatch) -> AppResult<WatchItem> {
     }
     if let Some(n) = patch.note {
         c.execute("UPDATE watches SET note=?2 WHERE id=?1", params![id, n.chars().take(500).collect::<String>()])?;
+    }
+    if let Some(mp) = patch.my_price {
+        c.execute("UPDATE watches SET my_price=?2 WHERE id=?1", params![id, mp])?;
     }
     if let Some(t) = patch.title.filter(|t| !t.trim().is_empty()) {
         c.execute("UPDATE watches SET title=?2 WHERE id=?1", params![id, t.trim()])?;
@@ -259,7 +266,7 @@ pub async fn check(state: &AppState, app: Option<&AppHandle>, id: i64) -> AppRes
                     Some(l) => format!("{} {:.2} → {:.2}（{}）", currency, l, price, platforms::get(&state.db, &w.platform_id).map(|p| format!("{} {}", p.name, p.edition)).unwrap_or_default()),
                     None => format!("当前 {} {:.2}", currency, price),
                 };
-                crate::notify::push(app, &state.db, kind, "success", &title, &body, &format!("/track/watchlist?id={id}")).await;
+                crate::notify::push(app, &state.db, kind, "success", &title, &body, &format!("/track/watchlist?id={id}"), &w.url).await;
             }
         }
         Err(e) => {
@@ -273,7 +280,7 @@ pub async fn check(state: &AppState, app: Option<&AppHandle>, id: i64) -> AppRes
             };
             if fails == 3 {
                 if let Some(app) = app {
-                    crate::notify::push(app, &state.db, "error", "warning", &format!("「{}」连续 3 次读价失败", w.title.chars().take(30).collect::<String>()), &e, &format!("/track/watchlist?id={id}")).await;
+                    crate::notify::push(app, &state.db, "error", "warning", &format!("「{}」连续 3 次读价失败", w.title.chars().take(30).collect::<String>()), &e, &format!("/track/watchlist?id={id}"), "").await;
                 }
             }
         }

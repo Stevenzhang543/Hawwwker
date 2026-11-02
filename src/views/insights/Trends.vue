@@ -23,9 +23,16 @@ const COLORS = ["#3d7bff", "#ff9f1a", "#2fd27a", "#8a5cff", "#ff5a5f", "#13c2c2"
 
 onMounted(async () => {
   await Promise.all([store.loaded ? null : store.load(), store.monitors.length ? null : store.loadMonitors()]);
-  watchIds.value = store.items.slice(0, 3).map((w) => w.id);
+  autoPick();
   void load();
 });
+
+/** 没有选择时：自动选历史最多的 3 件追踪商品（没有追踪就选监控），保证图表不空。 */
+function autoPick() {
+  const ws = [...store.items].filter((w) => w.spark.length > 0).sort((a, b) => b.spark.length - a.spark.length).slice(0, 3);
+  watchIds.value = ws.map((w) => w.id);
+  if (!ws.length) monitorIds.value = store.monitors.filter((m) => m.runCount > 0).slice(0, 3).map((m) => m.id);
+}
 
 async function load() {
   if (!watchIds.value.length && !monitorIds.value.length) {
@@ -52,6 +59,8 @@ function toggle(kind: "w" | "m", id: number) {
   list.value = [...s];
 }
 
+/** 数据较少：每条曲线都不足 3 个点 */
+const sparse = computed(() => series.value.length > 0 && series.value.every((s) => s.points.length < 3));
 const currencies = computed(() => [...new Set(series.value.map((s) => s.currency))]);
 const mixed = computed(() => currencies.value.length > 1);
 const useIndex = computed(() => normalize.value || mixed.value);
@@ -119,12 +128,23 @@ const dayOpts = [
           <div class="card-head">
             <h3>价格曲线</h3>
             <span v-if="mixed" class="chip orange">多币种，已切换为指数（首日 = 100）</span>
+            <span v-if="sparse" class="chip" title="每条曲线不足 3 个价格点；追踪商品会按检查间隔持续记录，几天后曲线会更完整">数据较少 · 继续追踪几天会更完整</span>
             <span class="spacer"></span>
             <span class="faint tiny">指数化</span>
             <GSwitch v-model="normalize" small :disabled="mixed" />
           </div>
           <div v-if="loading && !series.length" class="skel" style="height: 320px"></div>
-          <div v-else-if="!series.length" class="empty"><div class="empty-icon"><Icon name="trend" /></div><p>在左侧选择至少一条曲线</p></div>
+          <div v-else-if="!series.length" class="empty">
+            <div class="empty-icon"><Icon name="trend" /></div>
+            <template v-if="store.items.length || store.monitors.length">
+              <p>在左侧选择要对比的商品或监控</p>
+              <button v-ripple class="btn sm" @click="autoPick"><Icon name="wand" />自动选择历史最多的 3 条</button>
+            </template>
+            <template v-else>
+              <p>还没有价格数据：先在搜索结果上点「追踪」，或创建一个定时监控。</p>
+              <router-link to="/track/watchlist?add=1" class="btn sm primary"><Icon name="plus" />追踪一件商品</router-link>
+            </template>
+          </div>
           <LineChart v-else :series="chart" :height="320" :format="fmt" :area="false" :band="chart.length === 1" />
         </section>
 

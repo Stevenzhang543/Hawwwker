@@ -50,7 +50,7 @@ function onVerified() {
           <span class="chip" :class="app.ai.verified ? 'green' : 'red'">{{ app.ai.verified ? `已连接 · ${app.ai.model}` : "未连接" }}</span>
           <span v-if="app.ai.verifiedAt" class="faint tiny">{{ ago(app.ai.verifiedAt) }}验证</span>
         </div>
-        <AiConfigForm @verified="onVerified" />
+        <AiConfigForm :auto-detect="!app.ai.verified" @verified="onVerified" />
       </section>
 
       <aside class="side">

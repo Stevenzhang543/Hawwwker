@@ -164,15 +164,15 @@ export function uid(): string {
 
 export function makeNotices(): Notice[] {
   const now = Date.now();
-  const rows: Omit<Notice, "id">[] = [
-    { kind: "target_hit", level: "success", title: "Sony WH-1000XM5 达到目标价", body: "Amazon.de 当前 €249.00，低于你设定的 €259（-12.4%）", link: "/track/watchlist?id=1", read: false, createdAt: new Date(now - 18 * 60_000).toISOString() },
-    { kind: "price_drop", level: "info", title: "Switch 2 马力欧套装降价 6.2%", body: "京东自营 ¥3,099 → ¥2,907", link: "/track/watchlist?id=2", read: false, createdAt: new Date(now - 2.5 * 3600_000).toISOString() },
+  const rows: (Omit<Notice, "id" | "url"> & { url?: string })[] = [
+    { kind: "target_hit", level: "success", title: "Sony WH-1000XM5 达到目标价", body: "Amazon.de 当前 €249.00，低于你设定的 €259（-12.4%）", link: "/track/watchlist?id=1", url: "https://www.amazon.de/dp/B09XS7JWHH", read: false, createdAt: new Date(now - 18 * 60_000).toISOString() },
+    { kind: "price_drop", level: "info", title: "Switch 2 马力欧套装降价 6.2%", body: "京东自营 ¥3,099 → ¥2,907", link: "/track/watchlist?id=2", url: "https://item.jd.com/100012043978.html", read: false, createdAt: new Date(now - 2.5 * 3600_000).toISOString() },
     { kind: "new_items", level: "info", title: "「露营灯 选品监控」发现 7 件新品", body: "最低 ¥23.8（1688），匹配度精确 5 件", link: "/track/monitors", read: false, createdAt: new Date(now - 5 * 3600_000).toISOString() },
     { kind: "login", level: "warning", title: "小红书登录已过期", body: "最近一次搜索遇到登录页，请到「账号与登录」重新登录", link: "/platforms/accounts", read: false, createdAt: new Date(now - 7 * 3600_000).toISOString() },
     { kind: "error", level: "error", title: "Joybuy 读价失败", body: "连续 3 次没有在商品页找到价格，可能是页面结构变化", link: "/track/watchlist?id=6", read: true, createdAt: new Date(now - 26 * 3600_000).toISOString() },
-    { kind: "price_drop", level: "info", title: "Dyson V15 在 idealo 最低价刷新", body: "€529 → €489（-7.6%）", link: "/track/watchlist?id=4", read: true, createdAt: new Date(now - 2 * 86400_000).toISOString() },
+    { kind: "price_drop", level: "info", title: "Dyson V15 在 idealo 最低价刷新", body: "€529 → €489（-7.6%）", link: "/track/watchlist?id=4", url: "https://www.idealo.de/preisvergleich/OffersOfProduct/201846385.html", read: true, createdAt: new Date(now - 2 * 86400_000).toISOString() },
     { kind: "system", level: "info", title: "汇率已更新", body: "ECB 参考汇率 · 1 EUR = 7.82 CNY", link: "/settings/data", read: true, createdAt: new Date(now - 3 * 86400_000).toISOString() },
     { kind: "new_items", level: "info", title: "「蓝牙耳机 欧洲价格带」完成第 42 次运行", body: "中位价 €89，较上周 -3.1%", link: "/insights/market", read: true, createdAt: new Date(now - 4 * 86400_000).toISOString() },
   ];
-  return rows.map((r, i) => ({ ...r, id: i + 1 }));
+  return rows.map((r, i) => ({ ...r, url: r.url ?? "", id: i + 1 }));
 }

@@ -8,12 +8,12 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_notification::NotificationExt;
 
-pub fn add(db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str) -> AppResult<Notice> {
+pub fn add(db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str, url: &str) -> AppResult<Notice> {
     let created = now_iso();
     let c = db.conn();
     c.execute(
-        "INSERT INTO notices(kind, level, title, body, link, read, created_at) VALUES(?1,?2,?3,?4,?5,0,?6)",
-        params![kind, level, title, body, link, created],
+        "INSERT INTO notices(kind, level, title, body, link, read, created_at, url) VALUES(?1,?2,?3,?4,?5,0,?6,?7)",
+        params![kind, level, title, body, link, created, url],
     )?;
     Ok(Notice {
         id: c.last_insert_rowid(),
@@ -22,6 +22,7 @@ pub fn add(db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str
         title: title.into(),
         body: body.into(),
         link: link.into(),
+        url: url.into(),
         read: false,
         created_at: created,
     })
@@ -29,7 +30,7 @@ pub fn add(db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str
 
 pub fn list(db: &Db, limit: i64) -> AppResult<Vec<Notice>> {
     let c = db.conn();
-    let mut stmt = c.prepare("SELECT id, kind, level, title, body, link, read, created_at FROM notices ORDER BY id DESC LIMIT ?1")?;
+    let mut stmt = c.prepare("SELECT id, kind, level, title, body, link, read, created_at, url FROM notices ORDER BY id DESC LIMIT ?1")?;
     let rows = stmt.query_map([limit], |r| {
         Ok(Notice {
             id: r.get(0)?,
@@ -40,6 +41,7 @@ pub fn list(db: &Db, limit: i64) -> AppResult<Vec<Notice>> {
             link: r.get(5)?,
             read: r.get::<_, i64>(6)? != 0,
             created_at: r.get(7)?,
+            url: r.get(8)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -50,8 +52,8 @@ pub fn unread(db: &Db) -> i64 {
 }
 
 /// 新提醒：落库 + 推送前端 +（按设置）系统通知 + 群机器人。
-pub async fn push(app: &AppHandle, db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str) {
-    let Ok(n) = add(db, kind, level, title, body, link) else { return };
+pub async fn push(app: &AppHandle, db: &Db, kind: &str, level: &str, title: &str, body: &str, link: &str, url: &str) {
+    let Ok(n) = add(db, kind, level, title, body, link, url) else { return };
     let _ = app.emit("notice://new", &n);
     let settings: AppSettings = db.setting("app_settings").unwrap_or_default();
     let important = matches!(kind, "price_drop" | "target_hit" | "new_items" | "login") || level == "error";

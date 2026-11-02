@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
+import { openExternal } from "@/api";
 import { NOTICE_META, useNoticeStore } from "@/stores/notices";
 import { ago } from "@/utils/format";
 import Icon from "@/components/ui/Icon.vue";
@@ -10,12 +11,17 @@ const emit = defineEmits<{ close: [] }>();
 const notices = useNoticeStore();
 const router = useRouter();
 const root = ref<HTMLElement | null>(null);
-const recent = computed(() => notices.list.slice(0, 7));
+/** 轻量：只显示最近 5 条（未读优先），完整列表在「提醒中心」 */
+const recent = computed(() => [...notices.list].sort((a, b) => Number(a.read) - Number(b.read)).slice(0, 5));
 
 function open(n: Notice) {
   void notices.read(n.id);
   if (n.link) void router.push(n.link);
   emit("close");
+}
+function buy(n: Notice) {
+  void notices.read(n.id);
+  void openExternal(n.url);
 }
 function onDoc(e: MouseEvent) {
   if (root.value && !root.value.parentElement?.contains(e.target as Node)) emit("close");
@@ -40,16 +46,19 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onDoc));
     </div>
     <div v-else-if="!recent.length" class="empty" style="padding: 26px">暂无提醒</div>
     <div v-else class="pop-list">
-      <button v-for="n in recent" :key="n.id" class="n" :class="{ unread: !n.read }" @click="open(n)">
+      <div v-for="n in recent" :key="n.id" class="n" :class="{ unread: !n.read }" role="button" tabindex="0" @click="open(n)" @keydown.enter="open(n)">
         <span class="n-ico chip" :class="NOTICE_META[n.kind].tone"><Icon :name="NOTICE_META[n.kind].icon" :size="15" /></span>
         <span class="n-body">
           <b class="ellipsis">{{ n.title }}</b>
-          <small class="clamp2">{{ n.body }}</small>
+          <small class="ellipsis">{{ n.body }}</small>
         </span>
-        <small class="n-time">{{ ago(n.createdAt) }}</small>
-      </button>
+        <span class="n-side">
+          <small class="n-time">{{ ago(n.createdAt) }}</small>
+          <button v-if="n.url" class="btn primary sm n-buy" title="打开商品页（下单仍由你确认）" @click.stop="buy(n)"><Icon name="cart" :size="13" />去购买</button>
+        </span>
+      </div>
     </div>
-    <router-link to="/track/alerts" class="pop-foot" @click="emit('close')">查看全部提醒 <Icon name="arrow" :size="14" /></router-link>
+    <router-link to="/track/alerts" class="pop-foot" @click="emit('close')">查看全部{{ notices.list.length > recent.length ? `（${notices.list.length}）` : "" }} <Icon name="arrow" :size="14" /></router-link>
   </div>
 </template>
 
@@ -58,7 +67,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onDoc));
   position: absolute;
   right: 0;
   top: 42px;
-  width: 380px;
+  width: 360px;
   border-radius: 18px;
   padding: 6px;
   z-index: 80;
@@ -71,7 +80,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onDoc));
   padding: 8px 10px;
 }
 .pop-list {
-  max-height: 420px;
+  max-height: 360px;
   overflow-y: auto;
 }
 .n {
@@ -122,6 +131,18 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", onDoc));
 .n-body small {
   font-size: 12px;
   color: var(--text-2);
+}
+.n-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex: none;
+}
+.n-buy {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
 }
 .n-time {
   font-size: 11px;

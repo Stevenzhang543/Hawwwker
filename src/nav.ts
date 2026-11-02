@@ -1,9 +1,14 @@
-/** 一级分组 / 二级菜单（侧栏、面包屑、命令面板共用） */
+/**
+ * 一级入口 / 二级标签（v26.02）：侧栏只显示 5 个一级入口；二级页面以标签形式显示在页面顶部（PageTabs）。
+ * 命令面板仍然列出全部页面。
+ */
 export interface NavItem {
   path: string;
   label: string;
   icon: string;
   desc: string;
+  /** 页面顶部标签上的小标记，例如"高级" */
+  tag?: string;
 }
 export interface NavGroup {
   key: string;
@@ -15,7 +20,7 @@ export interface NavGroup {
 
 export const NAV: NavGroup[] = [
   {
-    key: "discover", label: "发现", en: "Discover", icon: "search",
+    key: "discover", label: "搜索", en: "Search", icon: "search",
     items: [
       { path: "/discover/search", label: "智能搜索", icon: "spark", desc: "一句话，多平台搜索与比价" },
       { path: "/discover/history", label: "搜索记录", icon: "history", desc: "回看历史运行与结果" },
@@ -40,7 +45,7 @@ export const NAV: NavGroup[] = [
     key: "platforms", label: "平台", en: "Platforms", icon: "layers",
     items: [
       { path: "/platforms/accounts", label: "账号与登录", icon: "key", desc: "国内版 / 国际版登录状态" },
-      { path: "/platforms/catalog", label: "平台目录", icon: "globe", desc: "启用平台、搜索模板、自定义" },
+      { path: "/platforms/catalog", label: "平台目录", icon: "globe", desc: "启用平台、检测、搜索模板、自定义", tag: "高级" },
     ],
   },
   {
@@ -53,6 +58,10 @@ export const NAV: NavGroup[] = [
     ],
   },
 ];
+
+export function findGroup(path: string): NavGroup | null {
+  return NAV.find((g) => g.items.some((i) => path.startsWith(i.path))) ?? null;
+}
 
 export function findNav(path: string): { group: NavGroup; item: NavItem } | null {
   for (const group of NAV) {

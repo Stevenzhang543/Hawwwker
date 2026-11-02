@@ -9,12 +9,9 @@ import Icon from "@/components/ui/Icon.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 import { clone } from "@/utils/clone";
 
-const props = defineProps<{ plan: SearchPlan; running?: boolean; collapsed?: boolean }>();
-const expanded = ref(!props.collapsed);
-watch(
-  () => props.collapsed,
-  (c) => (expanded.value = !c),
-);
+/** 默认折叠为一行摘要；展开后显示各平台搜索词与说明，可编辑后重新搜索 */
+const props = defineProps<{ plan: SearchPlan; running?: boolean; startExpanded?: boolean }>();
+const expanded = ref(props.startExpanded);
 const emit = defineEmits<{ rerun: [SearchPlan]; monitor: [SearchPlan] }>();
 const platforms = usePlatformStore();
 const editing = ref(false);
@@ -71,20 +68,30 @@ const numOrNull = (v: string) => (v.trim() === "" ? null : Number(v));
 </script>
 
 <template>
-  <section class="plan glass">
+  <section class="plan glass" :class="{ folded: !expanded && !editing }">
     <div class="plan-head">
-      <span class="pl-ico"><Icon name="wand" :size="16" /></span>
-      <h3>AI 搜索计划</h3>
-      <span class="chip purple">{{ plan.parser === "rules" ? "规则解析" : plan.parser === "ai" ? "AI 规划" : "AI + 规则" }}</span>
-      <span class="spacer"></span>
+      <span class="pl-ico"><Icon name="wand" :size="15" /></span>
+      <h3>AI 计划</h3>
+      <div v-if="!expanded && !editing" class="chips one-line" @click="expanded = true">
+        <span class="chip blue"><Icon name="target" />{{ GOAL[plan.goal] }}</span>
+        <span v-for="k in plan.keywords" :key="k" class="chip">{{ k }}</span>
+        <span v-if="budget" class="chip amber"><Icon name="tag" />{{ budget }}</span>
+        <span v-if="plan.condition !== 'any'" class="chip green">{{ CONDITION[plan.condition] }}</span>
+        <span v-for="x in plan.exclude" :key="x" class="chip red"><Icon name="x" />{{ x }}</span>
+        <span class="chip outline">{{ plan.platforms.length }} 个平台</span>
+      </div>
+      <template v-else>
+        <span class="chip purple">{{ plan.parser === "rules" ? "规则解析" : plan.parser === "ai" ? "AI 规划" : "AI + 规则" }}</span>
+        <span class="spacer"></span>
+      </template>
       <template v-if="!editing">
-        <button class="btn ghost sm" :disabled="running" @click="emit('monitor', plan)"><Icon name="clock" />保存为监控</button>
-        <button class="btn sm" :disabled="running" @click="startEdit"><Icon name="edit" />编辑计划</button>
+        <button class="btn ghost sm" :disabled="running" title="按这个计划定时重跑，发现新品或降价时提醒" @click="emit('monitor', plan)"><Icon name="clock" /><span v-if="expanded">保存为监控</span></button>
+        <button class="btn sm" :class="{ ghost: !expanded }" :disabled="running" title="修改关键词、预算、平台后重新搜索" @click="startEdit"><Icon name="edit" /><span v-if="expanded">编辑计划</span></button>
         <button class="icon-btn" :title="expanded ? '收起' : '展开搜索词与说明'" @click="expanded = !expanded"><Icon :name="expanded ? 'up' : 'down'" :size="16" /></button>
       </template>
     </div>
 
-    <div v-if="!editing" class="chips">
+    <div v-if="!editing && expanded" class="chips">
       <span class="chip blue"><Icon name="target" />{{ GOAL[plan.goal] }}</span>
       <span v-for="k in plan.keywords" :key="k" class="chip">{{ k }}</span>
       <span v-if="spec && !plan.keywords.includes(spec)" class="chip outline">{{ spec }}</span>
@@ -176,6 +183,28 @@ const numOrNull = (v: string) => (v.trim() === "" ? null : Number(v));
   align-items: center;
   gap: 10px;
   margin-bottom: 12px;
+  min-width: 0;
+}
+.plan.folded {
+  padding: 8px 12px;
+}
+.plan.folded .plan-head {
+  margin-bottom: 0;
+}
+.plan-head h3 {
+  white-space: nowrap;
+}
+.one-line {
+  flex: 1;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow: hidden;
+  cursor: pointer;
+  -webkit-mask-image: linear-gradient(90deg, #000 85%, transparent);
+  mask-image: linear-gradient(90deg, #000 85%, transparent);
+}
+.one-line .chip {
+  flex: none;
 }
 .plan-head h3 {
   font-size: 14.5px;

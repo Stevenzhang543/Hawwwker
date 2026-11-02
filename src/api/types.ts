@@ -181,6 +181,8 @@ export interface BrowserInfo {
   executable?: string | null;
   running: boolean;
   profileDir: string;
+  /** pipe = 管道通信（不开端口）；port = 回退的本地端口 */
+  transport: "pipe" | "port" | string;
 }
 
 /* ------------------------------------------------------------------ 搜索 */
@@ -271,6 +273,20 @@ export interface AlsoOn {
   url: string;
 }
 
+export type DealLevel = "lowest" | "low" | "normal" | "high" | "new";
+
+/** 价格判断：当前到手价相对本机记录的历史价格的位置 */
+export interface DealInfo {
+  level: DealLevel;
+  label: string;
+  basis: string;
+  low?: number | null;
+  median?: number | null;
+  high?: number | null;
+  points: number;
+  days: number;
+}
+
 export interface ResultItem {
   id: string;
   platformId: string;
@@ -298,6 +314,19 @@ export interface ResultItem {
   lastSeenAt: string;
   /** 最近价格（用于迷你走势），按时间升序 */
   spark: number[];
+  /** 运费（0 = 包邮；null = 未知） */
+  shipping?: number | null;
+  /** 券后价 / 满减后价 */
+  couponPrice?: number | null;
+  /** 到手价 = 券后价（或标价）+ 运费，原币种 */
+  landedPrice?: number | null;
+  /** 到手价换算到显示币种 */
+  displayLanded?: number | null;
+  deal?: DealInfo | null;
+  /** 渐进式结果：规则初判，AI 尚未核对 */
+  provisional?: boolean;
+  /** 用户反馈："irrelevant" = 标记为不相关 */
+  feedback?: string | null;
 }
 
 export interface AiSummary {
@@ -326,6 +355,7 @@ export type RunEventBody =
   | { type: "platform"; platformId: string; state: PlatformRunState; count?: number | null; message?: string | null; ms?: number | null }
   | { type: "filter"; fetched: number; kept: number; dropped: Record<string, number>; duplicates: number }
   | { type: "verify"; checked: number; matched: number; hidden: number }
+  | { type: "partial"; platformId: string; items: ResultItem[] }
   | { type: "results"; items: ResultItem[] }
   | { type: "summary"; summary: AiSummary }
   | { type: "log"; level: "info" | "warn" | "error"; message: string }
@@ -355,6 +385,7 @@ export interface ListingDetail {
   history: PricePoint[];
   alsoOn: AlsoOn[];
   watchId?: number | null;
+  deal?: DealInfo | null;
 }
 
 /* ------------------------------------------------------------------ 追踪与监控 */
@@ -384,6 +415,9 @@ export interface WatchItem {
   note: string;
   createdAt: string;
   spark: number[];
+  /** 商户：我的售价 */
+  myPrice?: number | null;
+  deal?: DealInfo | null;
 }
 
 export interface WatchAddInput {
@@ -402,6 +436,7 @@ export interface WatchPatch {
   enabled?: boolean;
   note?: string;
   title?: string;
+  myPrice?: number | null;
 }
 
 export interface Monitor {
@@ -448,6 +483,8 @@ export interface Notice {
   body: string;
   /** 应用内路由，例如 /track/watchlist?id=3 */
   link: string;
+  /** 外部链接（到价提醒的商品页，用于“去购买”） */
+  url: string;
   read: boolean;
   createdAt: string;
 }
@@ -567,4 +604,50 @@ export interface InsightDone {
   reportId: string;
   text: string;
   error?: string | null;
+}
+
+/* ------------------------------------------------------------------ v26.02 */
+export interface LinkInfo {
+  url: string;
+  platformId?: string | null;
+  platformName?: string | null;
+  title?: string | null;
+  price?: number | null;
+  currency?: string | null;
+  image?: string | null;
+  /** 建议的“全网找同款”搜索指令 */
+  instruction: string;
+  watchId?: number | null;
+  message?: string | null;
+}
+
+export interface LocalAi {
+  found: boolean;
+  baseUrl: string;
+  models: string[];
+}
+
+export interface Recommendation {
+  region: Region | "all";
+  ids: string[];
+  reason: string;
+}
+
+export interface SelfTestSample {
+  title: string;
+  price?: number | null;
+  currency: string;
+  landed?: number | null;
+  url: string;
+}
+
+export interface SelfTestResult {
+  platformId: string;
+  ok: boolean;
+  count: number;
+  withPrice: number;
+  samples: SelfTestSample[];
+  ms: number;
+  loginRequired: boolean;
+  message?: string | null;
 }

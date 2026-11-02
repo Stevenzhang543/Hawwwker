@@ -133,7 +133,7 @@ const regionOpts = [
       <div class="card-head"><h3>快捷键</h3></div>
       <div class="keys">
         <span><kbd>Ctrl K</kbd> 命令面板</span><span><kbd>Ctrl J</kbd> Copilot</span><span><kbd>Enter</kbd> 运行指令</span>
-        <span><kbd>Alt 1–5</kbd> 切换分组</span><span><kbd>Esc</kbd> 关闭弹层</span>
+        <span><kbd>Alt 1–5</kbd> 切换一级入口</span><span><kbd>Esc</kbd> 关闭弹层</span>
       </div>
       <p class="faint tiny" style="margin-top: 8px"><Icon name="info" :size="12" /> 在指令框中 Shift+Enter 换行。</p>
     </section>

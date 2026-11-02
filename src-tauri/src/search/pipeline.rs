@@ -127,6 +127,11 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
     let total = selected.len().max(1) as f64;
     let done_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let wait_secs = s.search.login_wait_secs as u64;
+    // "不相关"反馈：同一需求下用户标记过的商品
+    let scope = crate::deal::scope_of(&plan);
+    let irrelevant = crate::deal::irrelevant_set(&st.db, &scope);
+    let display0 = s.display_currency.clone();
+    let (plan_ref, irr_ref, disp_ref) = (&plan, &irrelevant, &display0);
     let futs = selected.iter().map(|p| {
         let queries: Vec<String> = plan.queries.iter().filter(|q| q.platform_id == p.id).map(|q| q.q.clone()).collect();
         let done_count = done_count.clone();
@@ -170,6 +175,13 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
                 Outcome::Cancelled => ("skipped", vec![], Some("已取消".to_string())),
             };
             platform_state(&h, app, &p.id, state, Some(cands.len() as u32), msg.clone(), Some(ms));
+            // 渐进式结果：这个平台的结果先按规则初判显示，AI 核对完成后再整体替换
+            if !cands.is_empty() {
+                let partial = provisional_items(&cands, plan_ref, disp_ref, &st.fx, irr_ref);
+                if !partial.is_empty() {
+                    h.emit(app, RunEventBody::Partial { platform_id: p.id.clone(), items: partial });
+                }
+            }
             stage(&h, app, "search", "多平台并行搜索", 0.12 + 0.43 * (n as f64 / total));
             (p.clone(), cands, PlatformStat { platform_id: p.id.clone(), state: state.into(), count: 0, ms, message: msg })
         }
@@ -252,6 +264,11 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
         if c.is_ad && !m.flags.iter().any(|f| f == "ad") {
             m.flags.push("ad".into());
         }
+        if irrelevant.contains(&(c.platform_id.clone(), c.external_id.clone())) {
+            m.verdict = "mismatch".into();
+            m.score = m.score.min(10);
+            m.reasons = vec!["你之前标记为不相关".into()];
+        }
         if m.verdict == "mismatch" {
             hidden += 1;
         } else if m.verdict == "exact" || m.verdict == "close" {
@@ -269,6 +286,7 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
         "related" => 2,
         _ => 3,
     };
+    // 价格排序按"到手价"（券后 + 运费）
     let dp = |c: &Candidate| price_in(c, &display, &st.fx);
     scored.sort_by(|a, b| {
         let (ra, rb) = (rank_of(&a.1.verdict), rank_of(&b.1.verdict));
@@ -315,8 +333,8 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
         for (rank, ((c, m, _), cluster)) in visible.iter().zip(cl.iter()).enumerate() {
             let id: String = conn.query_row(
                 "INSERT INTO listings(id, platform_id, external_id, title, url, image, price, currency, original_price, sales, rating, reviews,
-                   shop, location, condition, first_seen_at, last_seen_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14,?15,?15)
+                   shop, location, condition, first_seen_at, last_seen_at, shipping, coupon_price)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,NULL,?14,?15,?15,?16,?17)
                  ON CONFLICT(platform_id, external_id) DO UPDATE SET title=excluded.title,
                    url=CASE WHEN excluded.url<>'' THEN excluded.url ELSE listings.url END,
                    image=COALESCE(excluded.image, listings.image), price=COALESCE(excluded.price, listings.price),
@@ -324,10 +342,10 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
                    rating=COALESCE(excluded.rating, listings.rating), reviews=COALESCE(excluded.reviews, listings.reviews),
                    shop=COALESCE(excluded.shop, listings.shop),
                    condition=CASE WHEN excluded.condition<>'unknown' THEN excluded.condition ELSE listings.condition END,
-                   last_seen_at=excluded.last_seen_at
+                   last_seen_at=excluded.last_seen_at, shipping=excluded.shipping, coupon_price=excluded.coupon_price
                  RETURNING id",
                 params![uuid::Uuid::new_v4().to_string(), c.platform_id, c.external_id, c.title, c.url, c.image, c.price, c.currency,
-                        c.original_price, c.sales, c.rating, c.reviews, c.shop, c.condition, now],
+                        c.original_price, c.sales, c.rating, c.reviews, c.shop, c.condition, now, c.shipping, c.coupon_price],
                 |r| r.get(0),
             )?;
             if let Some(price) = c.price {
@@ -352,33 +370,18 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
                 let rows = stmt.query_map([&id], |r| r.get::<_, f64>(0))?;
                 rows.filter_map(|r| r.ok()).collect()
             };
-            let display_price = c.price.and_then(|p| st.fx.convert(p, &c.currency, &display));
-            items.push(ResultItem {
-                id: id.clone(),
-                platform_id: c.platform_id.clone(),
-                external_id: c.external_id.clone(),
-                title: c.title.clone(),
-                url: c.url.clone(),
-                image: c.image.clone(),
-                price: c.price,
-                currency: c.currency.clone(),
-                display_price,
-                original_price: c.original_price,
-                sales: c.sales,
-                rating: c.rating,
-                reviews: c.reviews,
-                shop: c.shop.clone(),
-                location: None,
-                condition: c.condition.clone(),
-                match_info: m.clone(),
-                cluster_id: cluster.clone(),
-                also_on: vec![],
-                watched,
-                rank: rank as u32 + 1,
-                first_seen_at: first_seen,
-                last_seen_at: now.clone(),
-                spark,
-            });
+            let mut it = base_item(c, id.clone(), m.clone(), &display, &st.fx, &now);
+            it.provisional = false;
+            it.cluster_id = cluster.clone();
+            it.watched = watched;
+            it.rank = rank as u32 + 1;
+            it.first_seen_at = first_seen;
+            it.spark = spark;
+            it.deal = c.price.and_then(|p| crate::deal::for_listing(&conn, &id, p, &c.currency));
+            if irrelevant.contains(&(c.platform_id.clone(), c.external_id.clone())) {
+                it.feedback = Some("irrelevant".into());
+            }
+            items.push(it);
         }
         // 同款"也在"
         let mut by_cluster: HashMap<String, Vec<AlsoOn>> = HashMap::new();
@@ -447,6 +450,60 @@ async fn execute(st: &AppState, app: Option<&AppHandle>, h: &Arc<RunHandle>, mut
     Ok(RunOutcome { status: "done".into(), results: items, new_ids, best_price, currency: display, error: None })
 }
 
+/* ---------------- 结果条目 ---------------- */
+/// 由候选构造结果条目（到手价、换算价）；排名、走势、价格判断由调用方补充。
+pub fn base_item(c: &Candidate, id: String, m: MatchInfo, display: &str, fx: &crate::fx::Fx, now: &str) -> ResultItem {
+    let landed = c.landed();
+    ResultItem {
+        id,
+        platform_id: c.platform_id.clone(),
+        external_id: c.external_id.clone(),
+        title: c.title.clone(),
+        url: c.url.clone(),
+        image: c.image.clone(),
+        price: c.price,
+        currency: c.currency.clone(),
+        display_price: c.price.and_then(|p| fx.convert(p, &c.currency, display)),
+        original_price: c.original_price,
+        shipping: c.shipping,
+        coupon_price: c.coupon_price,
+        landed_price: landed,
+        display_landed: landed.and_then(|p| fx.convert(p, &c.currency, display)),
+        deal: None,
+        provisional: true,
+        feedback: None,
+        sales: c.sales,
+        rating: c.rating,
+        reviews: c.reviews,
+        shop: c.shop.clone(),
+        location: None,
+        condition: c.condition.clone(),
+        match_info: m,
+        cluster_id: None,
+        also_on: vec![],
+        watched: false,
+        rank: 0,
+        first_seen_at: now.to_string(),
+        last_seen_at: now.to_string(),
+        spark: vec![],
+    }
+}
+
+/// 渐进式结果：单个平台的候选经过过滤与规则初判后的条目（id 以 "p:" 开头，最终结果会替换它们）。
+fn provisional_items(cands: &[Candidate], plan: &SearchPlan, display: &str, fx: &crate::fx::Fx, irrelevant: &std::collections::HashSet<(String, String)>) -> Vec<ResultItem> {
+    let now = now_iso();
+    let out = filter::filter(cands.to_vec(), plan, fx);
+    let mut items: Vec<ResultItem> = out
+        .kept
+        .iter()
+        .filter(|c| !irrelevant.contains(&(c.platform_id.clone(), c.external_id.clone())))
+        .map(|c| base_item(c, format!("p:{}:{}", c.platform_id, c.external_id), rule_match(c, plan), display, fx, &now))
+        .collect();
+    items.sort_by_key(|x| std::cmp::Reverse(x.match_info.score));
+    items.truncate(40);
+    items
+}
+
 /* ---------------- 历史与回放 ---------------- */
 fn summary_row(r: &rusqlite::Row) -> rusqlite::Result<RunSummary> {
     let plan: SearchPlan = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
@@ -481,48 +538,62 @@ pub fn load_items(db: &Db, run_id: &str, display: &str, fx: &crate::fx::Fx) -> A
         "SELECT l.id, l.platform_id, l.external_id, l.title, l.url, l.image, l.price, l.currency, l.original_price, l.sales, l.rating,
                 l.reviews, l.shop, l.location, l.condition, l.first_seen_at, l.last_seen_at,
                 rr.rank, rr.score, rr.verdict, rr.reasons, rr.flags, rr.cluster, rr.ai_checked, rr.also_on,
-                EXISTS(SELECT 1 FROM watches w WHERE w.listing_id=l.id)
+                EXISTS(SELECT 1 FROM watches w WHERE w.listing_id=l.id), l.shipping, l.coupon_price
          FROM run_results rr JOIN listings l ON l.id=rr.listing_id WHERE rr.run_id=?1 ORDER BY rr.rank",
     )?;
     let rows = stmt.query_map([run_id], |r| {
-        let price: Option<f64> = r.get(6)?;
-        let currency: String = r.get(7)?;
-        Ok(ResultItem {
-            id: r.get(0)?,
+        let cand = Candidate {
             platform_id: r.get(1)?,
             external_id: r.get(2)?,
             title: r.get(3)?,
             url: r.get(4)?,
             image: r.get(5)?,
-            display_price: price.and_then(|p| fx.convert(p, &currency, display)),
-            price,
-            currency,
+            price: r.get(6)?,
+            currency: r.get(7)?,
             original_price: r.get(8)?,
             sales: r.get(9)?,
             rating: r.get(10)?,
             reviews: r.get(11)?,
             shop: r.get(12)?,
-            location: r.get(13)?,
             condition: r.get(14)?,
-            first_seen_at: r.get(15)?,
-            last_seen_at: r.get(16)?,
-            rank: r.get(17)?,
-            match_info: MatchInfo {
-                score: r.get(18)?,
-                verdict: r.get(19)?,
-                reasons: serde_json::from_str(&r.get::<_, String>(20)?).unwrap_or_default(),
-                flags: serde_json::from_str(&r.get::<_, String>(21)?).unwrap_or_default(),
-                ai_checked: r.get::<_, i64>(23)? != 0,
-            },
-            cluster_id: r.get(22)?,
-            also_on: serde_json::from_str(&r.get::<_, String>(24)?).unwrap_or_default(),
-            watched: r.get::<_, i64>(25)? != 0,
-            spark: vec![],
-        })
+            shipping: r.get(26)?,
+            coupon_price: r.get(27)?,
+            ..Default::default()
+        };
+        let m = MatchInfo {
+            score: r.get(18)?,
+            verdict: r.get(19)?,
+            reasons: serde_json::from_str(&r.get::<_, String>(20)?).unwrap_or_default(),
+            flags: serde_json::from_str(&r.get::<_, String>(21)?).unwrap_or_default(),
+            ai_checked: r.get::<_, i64>(23)? != 0,
+        };
+        let mut it = base_item(&cand, r.get(0)?, m, display, fx, "");
+        it.provisional = false;
+        it.location = r.get(13)?;
+        it.first_seen_at = r.get(15)?;
+        it.last_seen_at = r.get(16)?;
+        it.rank = r.get(17)?;
+        it.cluster_id = r.get(22)?;
+        it.also_on = serde_json::from_str(&r.get::<_, String>(24)?).unwrap_or_default();
+        it.watched = r.get::<_, i64>(25)? != 0;
+        Ok(it)
     })?;
     let mut items: Vec<ResultItem> = rows.filter_map(|r| r.ok()).collect();
+    let scope: Option<String> = c
+        .query_row("SELECT plan FROM runs WHERE id=?1", [run_id], |r| r.get::<_, String>(0))
+        .ok()
+        .and_then(|p| serde_json::from_str::<SearchPlan>(&p).ok())
+        .map(|p| crate::deal::scope_of(&p));
+    drop(stmt);
+    drop(c);
+    let irrelevant = scope.map(|sc| crate::deal::irrelevant_set(db, &sc)).unwrap_or_default();
+    let c = db.conn();
     for it in items.iter_mut() {
         it.spark = spark(&c, &it.id);
+        it.deal = it.price.and_then(|p| crate::deal::for_listing(&c, &it.id, p, &it.currency));
+        if irrelevant.contains(&(it.platform_id.clone(), it.external_id.clone())) {
+            it.feedback = Some("irrelevant".into());
+        }
     }
     Ok(items)
 }
@@ -573,18 +644,22 @@ pub fn listing_detail(db: &Db, fx: &crate::fx::Fx, id: &str, display: &str) -> A
         Some(i) => i,
         None => c
             .query_row(
-                "SELECT id, platform_id, external_id, title, url, image, price, currency, original_price, sales, rating, reviews, shop, location, condition, first_seen_at, last_seen_at FROM listings WHERE id=?1",
+                "SELECT id, platform_id, external_id, title, url, image, price, currency, original_price, sales, rating, reviews, shop, location,
+                        condition, first_seen_at, last_seen_at, shipping, coupon_price FROM listings WHERE id=?1",
                 [id],
                 |r| {
-                    let price: Option<f64> = r.get(6)?;
-                    let currency: String = r.get(7)?;
-                    Ok(ResultItem {
-                        id: r.get(0)?, platform_id: r.get(1)?, external_id: r.get(2)?, title: r.get(3)?, url: r.get(4)?, image: r.get(5)?,
-                        display_price: price.and_then(|p| fx.convert(p, &currency, display)), price, currency, original_price: r.get(8)?,
-                        sales: r.get(9)?, rating: r.get(10)?, reviews: r.get(11)?, shop: r.get(12)?, location: r.get(13)?, condition: r.get(14)?,
-                        first_seen_at: r.get(15)?, last_seen_at: r.get(16)?, rank: 0, match_info: MatchInfo::default(), cluster_id: None,
-                        also_on: vec![], watched: false, spark: vec![],
-                    })
+                    let cand = Candidate {
+                        platform_id: r.get(1)?, external_id: r.get(2)?, title: r.get(3)?, url: r.get(4)?, image: r.get(5)?,
+                        price: r.get(6)?, currency: r.get(7)?, original_price: r.get(8)?, sales: r.get(9)?, rating: r.get(10)?,
+                        reviews: r.get(11)?, shop: r.get(12)?, condition: r.get(14)?, shipping: r.get(17)?, coupon_price: r.get(18)?,
+                        ..Default::default()
+                    };
+                    let mut it = base_item(&cand, r.get(0)?, MatchInfo::default(), display, fx, "");
+                    it.provisional = false;
+                    it.location = r.get(13)?;
+                    it.first_seen_at = r.get(15)?;
+                    it.last_seen_at = r.get(16)?;
+                    Ok(it)
                 },
             )
             .optional()?
@@ -596,6 +671,7 @@ pub fn listing_detail(db: &Db, fx: &crate::fx::Fx, id: &str, display: &str) -> A
         .filter_map(|r| r.ok())
         .collect();
     let watch_id: Option<i64> = c.query_row("SELECT id FROM watches WHERE listing_id=?1 LIMIT 1", [id], |r| r.get(0)).optional()?;
+    let deal = item.price.and_then(|p| crate::deal::for_listing(&c, id, p, &item.currency));
     let also_on = item.also_on.clone();
-    Ok(ListingDetail { item, history, also_on, watch_id })
+    Ok(ListingDetail { item, deal, history, also_on, watch_id })
 }

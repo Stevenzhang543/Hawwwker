@@ -6,6 +6,7 @@ import type { Monitor } from "@/api/types";
 import { useWatchStore } from "@/stores/watch";
 import { useSearchStore } from "@/stores/search";
 import { useUiStore } from "@/stores/ui";
+import { usePlatformStore } from "@/stores/platforms";
 import { ago, interval, money } from "@/utils/format";
 import GSwitch from "@/components/ui/GSwitch.vue";
 import GSheet from "@/components/ui/GSheet.vue";
@@ -15,6 +16,9 @@ import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 const store = useWatchStore();
 const search = useSearchStore();
 const ui = useUiStore();
+const platforms = usePlatformStore();
+const expanded = ref<Record<number, boolean>>({});
+const menuFor = ref<number | null>(null);
 const router = useRouter();
 const loading = ref(true);
 const creating = ref(false);
@@ -99,39 +103,44 @@ const STATUS: Record<Monitor["lastStatus"], [string, string]> = { idle: ["等待
       <h3>还没有定时监控</h3>
       <p>在搜索计划卡上点「保存为监控」，或在这里直接新建。</p>
     </div>
-    <TransitionGroup v-else name="list" tag="div" class="stack" style="position: relative">
+    <TransitionGroup v-else name="list" tag="div" class="stack" style="position: relative; gap: 10px">
       <article v-for="m in store.monitors" :key="m.id" class="mc glass" :class="{ off: !m.enabled }">
-        <div class="mc-left">
-          <span class="mc-ico" :class="STATUS[m.lastStatus][1]"><Icon name="clock" :size="20" :class="{ spin: m.lastStatus === 'running' }" /></span>
-        </div>
-        <div class="mc-main">
-          <div class="row" style="gap: 8px">
-            <h3>{{ m.name }}</h3>
-            <span class="chip" :class="STATUS[m.lastStatus][1]">{{ STATUS[m.lastStatus][0] }}</span>
-            <span class="chip">每 {{ interval(m.intervalMinutes) }}</span>
-            <span v-if="m.targetPrice != null" class="chip amber"><Icon name="target" />目标 {{ money(m.targetPrice, m.currency) }}</span>
-          </div>
-          <p class="muted small ellipsis">{{ m.instruction }}</p>
-          <div class="row" style="gap: 6px; flex-wrap: wrap">
-            <PlatformBadge v-for="p in m.plan.platforms.slice(0, 8)" :key="p" :id="p" />
-          </div>
-        </div>
-        <div class="mc-stats">
-          <div><b class="num">{{ m.lastNewCount }}</b><small>上次新增</small></div>
-          <div><b class="num price amber">{{ m.bestPrice != null ? money(m.bestPrice, m.currency) : "—" }}</b><small>最低价</small></div>
-          <div><b class="num">{{ m.runCount }}</b><small>累计运行</small></div>
-        </div>
-        <div class="mc-side">
-          <GSwitch :model-value="m.enabled" @update:model-value="(v: boolean) => toggle(m, v)" />
-          <span class="faint tiny">{{ m.lastRunAt ? "上次 " + ago(m.lastRunAt) : "尚未运行" }}</span>
-          <span class="faint tiny">{{ m.enabled && m.nextRunAt ? "下次 " + ago(m.nextRunAt) : "" }}</span>
-          <div class="row" style="gap: 4px">
-            <button class="btn sm" :disabled="m.lastStatus === 'running'" @click="runNow(m)"><Icon name="play" />立即运行</button>
-            <button v-if="m.lastRunId" class="icon-btn" title="查看上次结果" @click="openLast(m)"><Icon name="eye" :size="16" /></button>
-            <button class="icon-btn" title="编辑" @click="edit(m)"><Icon name="edit" :size="16" /></button>
-            <button class="icon-btn" title="删除" @click="del(m)"><Icon name="trash" :size="16" /></button>
+        <!-- 第一行：名称 · 状态 · 关键数字 · 操作 -->
+        <div class="mc-l1">
+          <span class="mc-ico" :class="STATUS[m.lastStatus][1]" :title="STATUS[m.lastStatus][0]"><Icon name="clock" :size="16" :class="{ spin: m.lastStatus === 'running' }" /></span>
+          <h3 class="ellipsis">{{ m.name }}</h3>
+          <span class="chip" :class="STATUS[m.lastStatus][1]">{{ STATUS[m.lastStatus][0] }}</span>
+          <span v-if="m.targetPrice != null" class="chip amber"><Icon name="target" />目标 {{ money(m.targetPrice, m.currency) }}</span>
+          <span class="spacer"></span>
+          <span class="mc-best" title="最近一次运行的最低价"><small>最低</small><b class="price amber">{{ m.bestPrice != null ? money(m.bestPrice, m.currency) : "—" }}</b></span>
+          <GSwitch :model-value="m.enabled" small @update:model-value="(v: boolean) => toggle(m, v)" />
+          <button class="btn sm" :disabled="m.lastStatus === 'running'" @click="runNow(m)"><Icon name="play" />运行</button>
+          <div class="more" @mouseleave="menuFor = null">
+            <button class="icon-btn" title="更多" :aria-expanded="menuFor === m.id" @click="menuFor = menuFor === m.id ? null : m.id"><Icon name="menu" :size="16" /></button>
+            <Transition name="pop">
+              <div v-if="menuFor === m.id" class="more-menu glass-3">
+                <button :disabled="!m.lastRunId" @click="menuFor = null; openLast(m)"><Icon name="eye" :size="15" />查看上次结果</button>
+                <button @click="menuFor = null; edit(m)"><Icon name="edit" :size="15" />编辑</button>
+                <button class="danger" @click="menuFor = null; del(m)"><Icon name="trash" :size="15" />删除</button>
+              </div>
+            </Transition>
           </div>
         </div>
+        <!-- 第二行：指令 · 平台（折叠） · 时间与次数 -->
+        <div class="mc-l2">
+          <p class="muted small ellipsis" :title="m.instruction">{{ m.instruction }}</p>
+          <button class="chip click" :title="m.plan.platforms.map((p) => platforms.label(p)).join('、')" @click="expanded = { ...expanded, [m.id]: !expanded[m.id] }">
+            <Icon name="layers" />{{ m.plan.platforms.length }} 个平台<Icon :name="expanded[m.id] ? 'up' : 'down'" />
+          </button>
+          <span class="faint tiny nowrap">
+            每 {{ interval(m.intervalMinutes) }} · {{ m.lastRunAt ? "上次 " + ago(m.lastRunAt) : "尚未运行" }}<template v-if="m.enabled && m.nextRunAt"> · 下次 {{ ago(m.nextRunAt) }}</template> · 新增 {{ m.lastNewCount }} · 累计 {{ m.runCount }} 次
+          </span>
+        </div>
+        <Transition name="fade">
+          <div v-if="expanded[m.id]" class="mc-plats">
+            <PlatformBadge v-for="p in m.plan.platforms" :key="p" :id="p" />
+          </div>
+        </Transition>
       </article>
     </TransitionGroup>
 
@@ -167,17 +176,39 @@ const STATUS: Record<Monitor["lastStatus"], [string, string]> = { idle: ["等待
 <style scoped>
 .mc {
   display: flex;
-  align-items: center;
-  gap: 16px;
-  padding: 16px 18px;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px 12px 16px;
 }
 .mc.off {
   opacity: 0.62;
 }
+.mc-l1,
+.mc-l2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.mc-l2 {
+  padding-left: 38px;
+}
+.mc-l2 p {
+  flex: 1;
+  min-width: 0;
+}
+.mc-l1 h3 {
+  font-size: 14.5px;
+  min-width: 0;
+}
+.nowrap {
+  white-space: nowrap;
+}
 .mc-ico {
-  width: 44px;
-  height: 44px;
-  border-radius: 14px;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 10px;
   display: grid;
   place-items: center;
   background: var(--hover);
@@ -195,42 +226,64 @@ const STATUS: Record<Monitor["lastStatus"], [string, string]> = { idle: ["等待
   background: var(--err-bg);
   color: var(--err);
 }
-.mc-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+.mc-best {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  margin-right: 6px;
 }
-.mc-main h3 {
-  font-size: 15px;
-}
-.mc-stats {
-  display: flex;
-  gap: 18px;
-}
-.mc-stats > div {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  min-width: 70px;
-}
-.mc-stats b {
-  font-size: 17px;
-}
-.mc-stats small {
+.mc-best small {
   font-size: 11px;
   color: var(--text-3);
 }
-.mc-side {
+.mc-best b {
+  font-size: 15px;
+}
+.mc-plats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 38px;
+}
+.more {
+  position: relative;
+}
+.more-menu {
+  position: absolute;
+  right: 0;
+  top: 34px;
+  min-width: 160px;
+  padding: 6px;
+  border-radius: 12px;
+  z-index: 30;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
-  min-width: 220px;
+}
+.more-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: none;
+  background: transparent;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+  color: var(--text);
+}
+.more-menu button:hover:not(:disabled) {
+  background: var(--hover);
+}
+.more-menu button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.more-menu .danger {
+  color: var(--err);
 }
 @media (max-width: 1180px) {
-  .mc-stats {
+  .mc-l2 .tiny {
     display: none;
   }
 }

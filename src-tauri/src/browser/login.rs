@@ -326,7 +326,7 @@ impl LoginManager {
             }
             tokio::time::sleep(Duration::from_millis(1200)).await;
             browser.close_target(&target).await;
-            crate::notify::push(&app, &db, "login", "success", &format!("{} 已登录", p.name), "登录会话保存在本机，之后搜索会自动使用。", "/platforms/accounts").await;
+            crate::notify::push(&app, &db, "login", "success", &format!("{} 已登录", p.name), "登录会话保存在本机，之后搜索会自动使用。", "/platforms/accounts", "").await;
         } else if outcome.0 == "cancelled" || outcome.0 == "timeout" {
             browser.close_target(&target).await;
         }

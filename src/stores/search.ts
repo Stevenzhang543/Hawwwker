@@ -25,6 +25,8 @@ export interface RunState {
   filter: { fetched: number; kept: number; dropped: Record<string, number>; duplicates: number } | null;
   verify: { checked: number; matched: number; hidden: number } | null;
   results: ResultItem[];
+  /** 渐进式结果：各平台搜完即推送的规则初判结果（最终 results 到达后清空） */
+  partial: Record<string, ResultItem[]>;
   summary: AiSummary | null;
   stats: RunStats | null;
   logs: { level: string; message: string; t: number }[];
@@ -34,6 +36,19 @@ export interface RunState {
   finishedAt: number | null;
   /** 从历史加载（不是实时运行） */
   replay: boolean;
+}
+
+/** 稳定键：同一商品在初判（p:…）与最终结果（listing uuid）之间保持不变，用于原位替换 */
+export function itemKey(x: ResultItem): string {
+  return `${x.platformId}:${x.externalId}`;
+}
+
+/** 当前运行要展示的结果：最终结果优先，否则合并各平台的初判结果（按规则分排序） */
+export function visibleItems(r: RunState | null): ResultItem[] {
+  if (!r) return [];
+  if (r.results.length) return r.results;
+  const all = Object.values(r.partial).flat();
+  return all.sort((a, b) => b.match.score - a.match.score).map((x, i) => ({ ...x, rank: i + 1 }));
 }
 
 export const STAGES: { key: Stage; label: string }[] = [
@@ -48,7 +63,7 @@ export const STAGES: { key: Stage; label: string }[] = [
 function blank(runId: string, instruction: string, plan: SearchPlan | null): RunState {
   return {
     runId, instruction, plan, status: "running", stage: "plan", stageLabel: "理解指令", progress: 0.02, platforms: {},
-    filter: null, verify: null, results: [], summary: null, stats: null, logs: [], error: null, lastSeq: 0,
+    filter: null, verify: null, results: [], partial: {}, summary: null, stats: null, logs: [], error: null, lastSeq: 0,
     startedAt: Date.now(), finishedAt: null, replay: false,
   };
 }
@@ -96,8 +111,13 @@ export const useSearchStore = defineStore("search", () => {
       case "verify":
         r.verify = { checked: ev.checked, matched: ev.matched, hidden: ev.hidden };
         break;
+      case "partial":
+        // 用户在初判阶段标记过的反馈要保留
+        r.partial[ev.platformId] = ev.items.map((x) => ({ ...x, feedback: x.feedback ?? feedbackOf(r, x) }));
+        break;
       case "results":
-        r.results = ev.items;
+        r.results = ev.items.map((x) => ({ ...x, feedback: x.feedback ?? feedbackOf(r, x) }));
+        r.partial = {};
         break;
       case "summary":
         r.summary = ev.summary;
@@ -117,6 +137,13 @@ export const useSearchStore = defineStore("search", () => {
         finish(r, "cancelled");
         break;
     }
+  }
+
+  /** 某条结果在当前运行里是否已被用户标记（按 平台 + 外部 id，初判与最终结果通用） */
+  function feedbackOf(r: RunState, x: ResultItem): string | null {
+    const k = itemKey(x);
+    const hit = r.results.find((o) => itemKey(o) === k) ?? Object.values(r.partial).flat().find((o) => itemKey(o) === k);
+    return hit?.feedback ?? null;
   }
 
   function finish(r: RunState, status: RunStatus) {
@@ -259,6 +286,17 @@ export const useSearchStore = defineStore("search", () => {
     if (currentId.value === runId) currentId.value = null;
   }
 
+  /** "不相关"反馈：kind = irrelevant | clear。初判（p: 开头）与最终结果都支持。 */
+  async function setFeedback(runId: string, item: ResultItem, kind: "irrelevant" | "clear") {
+    await api.feedbackSet(item.id, runId, kind);
+    const r = runs[runId];
+    if (!r) return;
+    const k = itemKey(item);
+    const val = kind === "clear" ? null : kind;
+    for (const x of r.results) if (itemKey(x) === k) x.feedback = val;
+    for (const list of Object.values(r.partial)) for (const x of list) if (itemKey(x) === k) x.feedback = val;
+  }
+
   function markWatched(listingId: string, watched = true) {
     for (const r of Object.values(runs)) {
       const it = r.results.find((x) => x.id === listingId);
@@ -277,6 +315,6 @@ export const useSearchStore = defineStore("search", () => {
 
   return {
     runs, currentId, current, active, history, pendingPlan, listen, resume, start, planThenStart, cancel, loadRun,
-    loadHistory, remove, markWatched, clearCurrent, onFinish, catchUp,
+    loadHistory, remove, markWatched, clearCurrent, onFinish, catchUp, setFeedback,
   };
 });

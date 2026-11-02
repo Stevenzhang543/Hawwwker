@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, toRef } from "vue";
+import { computed, ref, toRef } from "vue";
 import type { AiSummary, CopilotAction, ResultItem } from "@/api/types";
 import { useTypewriter } from "@/composables/motion";
 import { usePlatformStore } from "@/stores/platforms";
@@ -8,6 +8,8 @@ import PriceTag from "@/components/ui/PriceTag.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 
 const props = defineProps<{ summary: AiSummary; results: ResultItem[] }>();
+/** 默认是一条横幅（结论 + 推荐款 + 下一步），展开看要点与注意事项 */
+const expanded = ref(false);
 const emit = defineEmits<{ action: [CopilotAction]; open: [ResultItem] }>();
 const platforms = usePlatformStore();
 const headline = useTypewriter(toRef(() => props.summary.headline), 70);
@@ -16,11 +18,31 @@ const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch
 </script>
 
 <template>
-  <section class="sum glass">
+  <section v-if="!expanded" class="sum banner-mode glass">
+    <div class="sum-glow"></div>
+    <span class="s-ico"><Icon name="spark" :size="15" /></span>
+    <div class="bm-text" @click="expanded = true">
+      <span class="eyebrow">AI 总结</span>
+      <p class="bm-head ellipsis" :title="summary.headline">{{ headline }}<span v-if="headline.length < summary.headline.length" class="caret"></span></p>
+    </div>
+    <button v-if="best" class="bm-best" :title="summary.bestPick?.why" @click="emit('open', best)">
+      <img v-if="best.image" :src="best.image" alt="" />
+      <span class="bm-tag">推荐</span>
+      <PriceTag :price="best.price" :currency="best.currency" :display="best.displayPrice" :landed="best.landedPrice" :display-landed="best.displayLanded" size="sm" amber />
+    </button>
+    <button v-for="(a, i) in summary.nextActions.slice(0, 2)" :key="i" v-ripple class="btn sm ghost bm-act" @click="emit('action', a)">
+      <Icon :name="actIcon[a.type]" />{{ a.label }}
+    </button>
+    <button class="icon-btn" title="展开要点、价格判断与注意事项" @click="expanded = true"><Icon name="down" :size="16" /></button>
+  </section>
+
+  <section v-else class="sum glass">
     <div class="sum-glow"></div>
     <div class="sum-head">
       <span class="s-ico"><Icon name="spark" :size="16" /></span>
       <span class="eyebrow">AI 总结</span>
+      <span class="spacer"></span>
+      <button class="icon-btn" title="收起" @click="expanded = false"><Icon name="up" :size="16" /></button>
     </div>
     <h2 class="headline">{{ headline }}<span v-if="headline.length < summary.headline.length" class="caret"></span></h2>
 
@@ -41,7 +63,7 @@ const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch
         <div class="best-info">
           <PlatformBadge :id="best.platformId" />
           <p class="clamp2 best-title">{{ best.title }}</p>
-          <PriceTag :price="best.price" :currency="best.currency" :display="best.displayPrice" amber />
+          <PriceTag :price="best.price" :currency="best.currency" :display="best.displayPrice" :landed="best.landedPrice" :display-landed="best.displayLanded" amber />
           <p class="why">{{ summary.bestPick?.why }}</p>
         </div>
       </button>
@@ -71,6 +93,67 @@ const actIcon: Record<CopilotAction["type"], string> = { search: "search", watch
   background: radial-gradient(circle, rgba(138, 92, 255, 0.22), transparent 65%);
   pointer-events: none;
   z-index: -1;
+}
+.banner-mode {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  min-height: 56px;
+}
+.bm-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  cursor: pointer;
+}
+.bm-text .eyebrow {
+  font-size: 10.5px;
+}
+.bm-head {
+  font-size: 14.5px;
+  font-weight: 680;
+  letter-spacing: -0.01em;
+}
+.bm-head .caret {
+  height: 15px;
+}
+.bm-best {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 4px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 176, 32, 0.45);
+  background: var(--glass-1);
+  cursor: pointer;
+  flex: none;
+  max-width: 240px;
+}
+.bm-best img {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+  object-fit: cover;
+}
+.bm-tag {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #ffbe3d, #ff9a1f);
+  color: #2b1800;
+}
+.bm-act {
+  flex: none;
+}
+@media (max-width: 1240px) {
+  .bm-act {
+    display: none;
+  }
 }
 .sum-head {
   display: flex;

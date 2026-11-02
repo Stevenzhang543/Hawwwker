@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { toAppError } from "@/api";
-import type { Region, Role } from "@/api/types";
+import { api, toAppError } from "@/api";
+import type { LoginNeed, Recommendation, Region, Role } from "@/api/types";
 import { ROLE_HOME, ROLE_LABEL, useAppStore } from "@/stores/app";
 import { usePlatformStore } from "@/stores/platforms";
 import { useUiStore } from "@/stores/ui";
@@ -44,7 +44,47 @@ const ROLES: { r: Role; icon: string; title: string; desc: string; flow: string 
   { r: "analyst", icon: "chart", title: "我做平台 / 市场分析", desc: "定时监控品类，分析平台价差、价格分布与趋势", flow: "配置平台 → 监视价格走势 → 分析报告" },
 ];
 
-const pool = computed(() => platforms.list.filter((p) => !p.custom && (region.value === "all" || p.region === region.value)));
+/* 第 4 步：按所在地区推荐平台（首次进入时自动选中推荐项） */
+const rec = ref<Recommendation | null>(null);
+const recApplied = ref(false);
+const tz = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+})();
+watch(step, async (n) => {
+  if (n !== 3 || rec.value) return;
+  try {
+    rec.value = await api.platformsRecommend(tz, navigator.language || "");
+    if (rec.value.region === "cn") region.value = "cn";
+    await applyRec(false);
+  } catch {
+    /* 推荐失败不影响手动选择 */
+  }
+});
+const recSet = computed(() => new Set(rec.value?.ids ?? []));
+async function applyRec(only: boolean) {
+  if (!rec.value) return;
+  const jobs = platforms.list
+    .filter((p) => (recSet.value.has(p.id) && !p.enabled) || (only && !recSet.value.has(p.id) && p.enabled && !p.custom))
+    .map((p) => platforms.update(p.id, { enabled: recSet.value.has(p.id) }));
+  try {
+    await Promise.all(jobs);
+    recApplied.value = true;
+    if (only) ui.toast(`已只保留 ${recSet.value.size} 个推荐平台`, "success", 2200);
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error");
+  }
+}
+const LOGIN_BADGE: Record<LoginNeed, [string, string]> = { required: ["需登录", "orange"], recommended: ["建议登录", "blue"], optional: ["免登录", "green"] };
+
+const pool = computed(() =>
+  platforms.list
+    .filter((p) => !p.custom && (region.value === "all" || p.region === region.value))
+    .sort((a, b) => Number(recSet.value.has(b.id)) - Number(recSet.value.has(a.id))),
+);
 async function togglePlatform(id: string, v: boolean) {
   try {
     await platforms.update(id, { enabled: v });
@@ -125,12 +165,17 @@ const regionOpts = [
           <section v-else-if="step === 2" key="2" class="pane">
             <h2>连接 AI 模型 <span class="chip red" style="vertical-align: 3px">必需</span></h2>
             <p class="muted">Hawwwker 的搜索规划、结果校验、总结与 Copilot 都由 AI 完成。选择服务商、填入 Key，测试通过后即可继续。</p>
-            <AiConfigForm compact style="margin-top: 14px" @verified="ui.toast('AI 连接成功', 'success')" />
+            <AiConfigForm compact auto-detect style="margin-top: 14px" @verified="ui.toast('AI 连接成功', 'success')" />
           </section>
 
           <section v-else-if="step === 3" key="3" class="pane">
             <h2>选择要使用的平台</h2>
-            <p class="muted">之后可以在「平台目录」随时调整。需要登录的平台在「账号与登录」里登录一次即可长期使用。</p>
+            <p class="muted">之后可以在「平台目录」随时调整。标「需登录」的平台在「账号与登录」里登录一次即可长期使用；「免登录」的平台装好就能搜。</p>
+            <div v-if="rec" class="rec">
+              <Icon name="compass" :size="18" />
+              <span class="rec-text"><b>{{ rec.reason }}</b><small>{{ tz ? `按你的时区 ${tz} 推荐` : "按系统语言推荐" }} · 已为你选中 {{ rec.ids.length }} 个推荐平台</small></span>
+              <button class="btn sm" @click="applyRec(true)">只保留推荐</button>
+            </div>
             <div class="row" style="margin: 12px 0">
               <GSegmented v-model="region" :options="regionOpts" small />
               <span class="spacer"></span>
@@ -139,7 +184,10 @@ const regionOpts = [
             <div class="plats">
               <button v-for="p in pool" :key="p.id" class="plat" :class="{ on: p.enabled }" @click="togglePlatform(p.id, !p.enabled)">
                 <i class="glyph" :style="{ background: p.color }">{{ p.glyph }}</i>
-                <span class="pl-name"><b>{{ p.name }}</b><small>{{ p.edition }}</small></span>
+                <span class="pl-name">
+                  <b>{{ p.name }}<Icon v-if="recSet.has(p.id)" name="star" :size="11" class="rec-star" /></b>
+                  <small><em class="need" :class="LOGIN_BADGE[p.login][1]">{{ LOGIN_BADGE[p.login][0] }}</em>{{ p.edition }}</small>
+                </span>
                 <span class="pl-ck"><Icon name="check" :size="12" :stroke="3" /></span>
               </button>
             </div>
@@ -381,6 +429,56 @@ const regionOpts = [
 }
 .role.on .r-ck {
   transform: scale(1);
+}
+.rec {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: var(--info-bg);
+  color: var(--brand-ink);
+}
+.rec-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+}
+.rec-text b {
+  font-size: 13px;
+  color: var(--text);
+}
+.rec-text small {
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.rec-star {
+  color: var(--amber);
+  margin-left: 4px;
+  vertical-align: -1px;
+}
+.need {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 4px;
+  margin-right: 4px;
+  border-radius: 4px;
+}
+.need.orange {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+.need.blue {
+  background: var(--info-bg);
+  color: var(--brand-ink);
+}
+.need.green {
+  background: var(--ok-bg);
+  color: var(--ok);
 }
 .plats {
   display: grid;

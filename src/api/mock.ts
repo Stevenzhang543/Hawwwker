@@ -7,6 +7,7 @@ import type {
   CopilotSendInput, CustomPlatformInput, ListingDetail, LoginState, MarketOverview, Monitor, MonitorCreateInput,
   MonitorPatch, Notice, PlatformInfo, PlatformPatch, PricePoint, ResultItem, RunDetail, RunEvent, RunEventBody, RunStats,
   RunSummary, SearchPlan, TrendSeries, Verdict, WatchAddInput, WatchItem, WatchPatch, PlatformStat,
+  DealInfo, LinkInfo, LocalAi, Recommendation, SelfTestResult,
 } from "./types";
 import {
   FX, PRESETS, SKILLS, fxConvert, hash, makeLogins, makeNotices, makePlatforms, productImage, rng, uid,
@@ -166,6 +167,32 @@ function mockPlan(instruction: string): SearchPlan {
   };
 }
 
+/** 与 Rust deal::verdict 相同的规则：按本机历史价格判断当前价位置。 */
+function mockDeal(hist: PricePoint[], current: number | null | undefined, currency: string): DealInfo | null {
+  if (current == null) return null;
+  const pts = hist.filter((h) => h.currency === currency && Date.now() - new Date(h.t).getTime() <= 180 * 86400_000);
+  const days = pts.length ? Math.round((Date.now() - new Date(pts[0]!.t).getTime()) / 86400_000) : 0;
+  const prices = pts.map((h) => h.price).sort((a, b) => a - b);
+  const q = (f: number) => prices[Math.min(prices.length - 1, Math.floor(f * (prices.length - 1)))]!;
+  if (prices.length < 3 || days < 2) {
+    return { level: "new", label: "数据积累中", basis: `已记录 ${prices.length} 次价格，再观察几天就能判断`, low: prices[0] ?? null, median: null, high: prices[prices.length - 1] ?? null, points: prices.length, days };
+  }
+  const low = prices[0]!, median = q(0.5), high = prices[prices.length - 1]!, p25 = q(0.25);
+  const basis = `${days} 天内 ${prices.length} 次观测，最低 ${low}，中位 ${median}`;
+  const [level, label] = current <= low * 1.005 ? ["lowest", days >= 30 ? "历史最低" : "近期最低"] : current <= p25 ? ["low", "近期低位"] : current <= median * 1.05 ? ["normal", "价格正常"] : ["high", "偏高"];
+  return { level: level as DealInfo["level"], label, basis, low, median, high, points: prices.length, days };
+}
+
+/** 模拟运费 / 券后价，与真实解析器输出同样的字段。 */
+function mockLanded(price: number, currency: string, cn: boolean, k: number, r: () => number) {
+  const shipping = cn ? (k % 4 === 3 ? 8 : 0) : k % 3 === 0 ? 0 : currency === "JPY" ? 550 : 4.99;
+  const coupon = cn && r() < 0.45 ? round(price * (0.9 + r() * 0.06), currency) : !cn && r() < 0.2 ? round(price * 0.9, currency) : null;
+  const landed = round((coupon ?? price) + shipping, currency);
+  return { shipping, couponPrice: coupon, landedPrice: landed, displayLanded: round(fxConvert(landed, currency, settings.displayCurrency), settings.displayCurrency) };
+}
+
+const feedbackMap = new Map<string, string>();
+
 const VARIANTS: { suffix: string; suffixDe: string; verdict: Verdict; score: number; flags: string[]; reasons: string[]; mult: number; cond: "new" | "used" | "unknown" }[] = [
   { suffix: " 官方正品 全新国行", suffixDe: " – Neu & OVP", verdict: "exact", score: 96, flags: [], reasons: ["品牌与型号完全一致", "全新正品"], mult: 1, cond: "new" },
   { suffix: " 旗舰店 官方标配", suffixDe: " Kopfhörer, Schwarz", verdict: "exact", score: 92, flags: [], reasons: ["型号一致", "官方渠道"], mult: 1.04, cond: "new" },
@@ -197,6 +224,7 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
       const en = p.region === "intl" && !de;
       const title = p.region === "cn" ? `${kw}${v.suffix}` : de ? `${kw}${v.suffixDe}` : en ? `${kw} ${v.verdict === "mismatch" ? "Case / Ear Pads Accessory" : v.cond === "used" ? "Used - Very Good" : "Wireless, Black"}` : `${kw}${v.suffix}`;
       const hist = walk(hash(id), price, 60, p.currency, 24);
+      const landed = mockLanded(price, p.currency, p.region === "cn", k, r);
       const item: ResultItem = {
         id, platformId: pid, externalId: id.split(":")[1] ?? id, title, url: p.home + "item/" + (id.split(":")[1] ?? ""), image: productImage(hash(id), k),
         price, currency: p.currency, displayPrice: round(fxConvert(price, p.currency, settings.displayCurrency), settings.displayCurrency),
@@ -207,7 +235,9 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
         match: { score: Math.max(3, Math.min(99, v.score + Math.round((r() - 0.5) * 8))), verdict: v.verdict, reasons: v.reasons, flags: v.flags, aiChecked: true },
         clusterId: v.verdict === "exact" ? `c-${seed}` : null, alsoOn: [], watched: false, rank: 0,
         firstSeenAt: hist[0]!.t, lastSeenAt: iso(), spark: hist.slice(-16).map((x) => x.price),
+        ...landed, deal: mockDeal(hist, landed.couponPrice ?? price, p.currency), provisional: false, feedback: feedbackMap.get(id) ?? null,
       };
+      if (item.feedback === "irrelevant") item.match = { ...item.match, verdict: "mismatch", reasons: ["你之前标记为不相关", ...item.match.reasons] };
       listings.set(id, { item, history: hist });
       out.push(item);
     }
@@ -218,7 +248,7 @@ function makeResults(runId: string, plan: SearchPlan, okPlatforms: string[]): Re
     it.alsoOn = cluster.filter((o) => o.id !== it.id && o.platformId !== it.platformId).slice(0, 4).map((o) => ({ listingId: o.id, platformId: o.platformId, price: o.price, currency: o.currency, url: o.url }));
   }
   const order: Record<Verdict, number> = { exact: 0, close: 1, related: 2, mismatch: 3 };
-  out.sort((a, b) => order[a.match.verdict] - order[b.match.verdict] || (plan.sort === "price_asc" ? (a.displayPrice ?? 0) - (b.displayPrice ?? 0) : b.match.score - a.match.score));
+  out.sort((a, b) => order[a.match.verdict] - order[b.match.verdict] || (plan.sort === "price_asc" ? (a.displayLanded ?? a.displayPrice ?? 0) - (b.displayLanded ?? b.displayPrice ?? 0) : b.match.score - a.match.score));
   out.forEach((x, i) => (x.rank = i + 1));
   return out;
 }
@@ -272,6 +302,7 @@ function startRun(instruction: string, plan: SearchPlan | null, trigger: "manual
   const ok = pids.filter((id) => !blocked.includes(id));
   const stats: PlatformStat[] = [];
   const t0 = Date.now();
+  const results = makeResults(runId, finalPlan, ok);
 
   at(60, () => push({ type: "stage", stage: "plan", label: "理解指令", progress: 0.05 }));
   at(520, () => push({ type: "plan", plan: finalPlan }));
@@ -294,12 +325,17 @@ function startRun(instruction: string, plan: SearchPlan | null, trigger: "manual
       if (i === 1) at(doneAt - 900, () => push({ type: "platform", platformId: id, state: "searching", message: "滚动加载第 2 屏…" }));
       at(doneAt, () => {
         push({ type: "platform", platformId: id, state: "done", count, ms: doneAt - 1100 - i * 260 });
+        const prov = results.filter((x) => x.platformId === id).map((x): ResultItem => {
+          const rule = Math.max(20, Math.min(95, x.match.score + ((hash(x.id) % 15) - 7)));
+          return { ...x, id: `p:${x.platformId}:${x.externalId}`, provisional: true, deal: null, alsoOn: [], clusterId: null,
+            match: { score: rule, verdict: rule >= 85 ? "exact" : rule >= 65 ? "close" : rule >= 35 ? "related" : "mismatch", reasons: ["标题包含关键词（规则初判）"], flags: x.match.flags, aiChecked: false } };
+        });
+        if (prov.length) push({ type: "partial", platformId: id, items: prov });
         stats.push({ platformId: id, state: "done", count, ms: doneAt - 1100, message: null });
       });
     }
   });
   const T = lastDone + 250;
-  const results = makeResults(runId, finalPlan, ok);
   const visible = results.filter((x) => x.match.verdict !== "mismatch");
   const hidden = results.length - visible.length;
   at(T, () => push({ type: "stage", stage: "extract", label: "抽取商品信息", progress: 0.55 }));
@@ -386,6 +422,7 @@ function refreshWatch(w: WatchItem) {
   w.highest = prices.length ? Math.max(...prices) : null;
   w.changePct = w.firstPrice && w.lastPrice ? ((w.lastPrice - w.firstPrice) / w.firstPrice) * 100 : null;
   w.spark = prices.slice(-24);
+  w.deal = mockDeal(h, w.lastPrice, w.currency);
 }
 
 function seedWatches() {
@@ -400,6 +437,7 @@ function seedWatches() {
       intervalMinutes: [360, 180, 720, 360, 360, 1440, 720, 1440][i] ?? 360, enabled: i !== 5, status: i === 5 ? "error" : "ok",
       lastError: i === 5 ? "连续 3 次没有在商品页找到价格" : null, lastCheckedAt: iso(Date.now() - (i + 1) * 47 * 60_000),
       nextCheckAt: iso(Date.now() + (i + 1) * 53 * 60_000), note, createdAt: hist[0]!.t, spark: [],
+      myPrice: pid === "temu" ? 15.9 : pid === "alibaba1688" ? 39 : null, deal: null,
     };
     refreshWatch(w);
     watches.push(w);
@@ -579,8 +617,8 @@ function loginSuccess(id: string) {
   addNotice({ kind: "login", level: "success", title: `${p?.name}${p?.region === "intl" ? " · " + p.edition : ""} 已登录`, body: "登录会话只保存在本机，之后搜索会自动使用。", link: "/platforms/accounts" });
 }
 
-function addNotice(n: Omit<Notice, "id" | "read" | "createdAt">) {
-  const notice: Notice = { ...n, id: ++noticeSeq, read: false, createdAt: iso() };
+function addNotice(n: Omit<Notice, "id" | "read" | "createdAt" | "url"> & { url?: string }) {
+  const notice: Notice = { ...n, url: n.url ?? "", id: ++noticeSeq, read: false, createdAt: iso() };
   notices.unshift(notice);
   emit("notice://new", notice);
 }
@@ -590,7 +628,7 @@ type Handler = (a: Record<string, unknown>) => unknown | Promise<unknown>;
 
 const H: Record<string, Handler> = {
   app_bootstrap: (): Bootstrap => ({
-    version: "26.01", dataDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app", settings: jclone(settings),
+    version: "26.02", dataDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app", settings: jclone(settings),
     ai: { ...aiStatus }, platforms: jclone(platforms), logins: jclone(logins), unread: notices.filter((n) => !n.read).length,
     runningRuns: [...runs.values()].filter((r) => r.summary.status === "running").map((r) => r.summary.id), fx: FX,
   }),
@@ -692,7 +730,7 @@ const H: Record<string, Handler> = {
     platforms.filter((o) => o.accountGroup === p?.accountGroup && o.id !== id).forEach((o) => setLogin(o.id, { status: "logged_out", flow: "idle", verifiedAt: null, message: null }));
     return setLogin(id, { status: "logged_out", flow: "idle", verifiedAt: null, cookieExpires: null, lastWallAt: null, message: "已退出，本机会话已删除" });
   },
-  browser_info: () => ({ executable: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", running: true, profileDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app\\browser-profile" }),
+  browser_info: () => ({ executable: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", running: true, profileDir: "C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app\\browser-profile", transport: "pipe" }),
   browser_show: () => undefined,
   browser_wipe: async () => {
     await sleep(600);
@@ -725,7 +763,7 @@ const H: Record<string, Handler> = {
     const l = listings.get(id as string);
     if (!l) throw err("NOT_FOUND", "商品不存在");
     const w = watches.find((x) => x.listingId === id);
-    return { item: { ...l.item, watched: !!w }, history: l.history, alsoOn: l.item.alsoOn, watchId: w?.id ?? null };
+    return { item: { ...l.item, watched: !!w }, history: l.history, alsoOn: l.item.alsoOn, watchId: w?.id ?? null, deal: l.item.deal ?? null };
   },
 
   watch_list: () => jclone(watches),
@@ -746,6 +784,7 @@ const H: Record<string, Handler> = {
       image: l?.item.image ?? productImage(id * 13, id), currency: l?.item.currency ?? p.currency, targetPrice: i.targetPrice ?? null, lastPrice: price,
       firstPrice: null, lowest: null, highest: null, changePct: null, intervalMinutes: i.intervalMinutes ?? 360, enabled: true, status: l ? "ok" : "new",
       lastError: null, lastCheckedAt: iso(), nextCheckAt: iso(Date.now() + (i.intervalMinutes ?? 360) * 60_000), note: i.note ?? "", createdAt: iso(), spark: [],
+      myPrice: null, deal: null,
     };
     refreshWatch(w);
     watches.unshift(w);
@@ -756,6 +795,7 @@ const H: Record<string, Handler> = {
     const w = watches.find((x) => x.id === id);
     if (!w) throw err("NOT_FOUND", "追踪项不存在");
     Object.assign(w, patch as WatchPatch);
+    refreshWatch(w);
     return { ...w };
   },
   watch_remove: ({ id }) => {
@@ -785,7 +825,7 @@ const H: Record<string, Handler> = {
       w.lastCheckedAt = iso();
       w.nextCheckAt = iso(Date.now() + w.intervalMinutes * 60_000);
       if (title(w) && next < last) {
-        addNotice({ kind: w.targetPrice && next <= w.targetPrice ? "target_hit" : "price_drop", level: "success", title: `${title(w)} 降价 ${(((last - next) / last) * 100).toFixed(1)}%`, body: `${P(w.platformId)?.name} 当前 ${next} ${w.currency}`, link: `/track/watchlist?id=${w.id}` });
+        addNotice({ kind: w.targetPrice && next <= w.targetPrice ? "target_hit" : "price_drop", level: "success", title: `${title(w)} 降价 ${(((last - next) / last) * 100).toFixed(1)}%`, body: `${P(w.platformId)?.name} 当前 ${next} ${w.currency}`, link: `/track/watchlist?id=${w.id}`, url: w.url });
       }
       emit("watch://updated", { ...w });
     }, 1600);
@@ -853,6 +893,73 @@ const H: Record<string, Handler> = {
     };
     window.setTimeout(tick, 700);
     return { reportId };
+  },
+
+  /* ---------------------------------------------------------- v26.02 */
+  link_inspect: async ({ url }): Promise<LinkInfo> => {
+    const u = String(url ?? "").trim();
+    if (!/^https?:\/\//i.test(u)) throw err("INVALID", "请粘贴以 http(s):// 开头的商品链接");
+    await sleep(900);
+    let host = "";
+    try { host = new URL(u).hostname.replace(/^www\./, ""); } catch { throw err("INVALID", "链接格式不正确"); }
+    const p = platforms.find((x) => { try { const h = new URL(x.home).hostname.replace(/^www\./, ""); return host === h || host.endsWith("." + h) || h.endsWith("." + host); } catch { return false; } });
+    const w = watches.find((x) => x.url === u);
+    const title = p?.region === "cn" ? "Apple AirPods Pro 2 USB-C 主动降噪 官方正品" : "Apple AirPods Pro 2 mit USB-C, Aktive Geräuschunterdrückung";
+    const price = p ? round(fxConvert(1599, "CNY", p.currency), p.currency) : null;
+    return { url: u, platformId: p?.id ?? null, platformName: p ? `${p.name}${p.region === "intl" ? " · " + p.edition : ""}` : null, title: p ? title : null, price, currency: p?.currency ?? null,
+      image: p ? productImage(hash(u), 2) : null, instruction: `全网找同款比价：${p ? title : u.slice(0, 60)}`, watchId: w?.id ?? null,
+      message: p ? null : "没有识别出平台，仍可直接搜索或追踪" };
+  },
+  feedback_set: ({ listingId, runId, kind }) => {
+    const id = String(listingId);
+    const real = id.startsWith("p:") ? id.slice(2) : id;
+    if (kind === "clear") feedbackMap.delete(real); else feedbackMap.set(real, String(kind));
+    const run = runs.get(String(runId));
+    run?.results.forEach((x) => { if (x.id === real) x.feedback = kind === "clear" ? null : String(kind); });
+    const l = listings.get(real);
+    if (l) l.item.feedback = kind === "clear" ? null : String(kind);
+  },
+  run_export: ({ runId, format }) => {
+    const r = runs.get(String(runId));
+    if (!r) throw err("NOT_FOUND", "运行不存在或已删除");
+    if (format === "csv") return `C:\\Users\\steven\\AppData\\Roaming\\com.hawwwker.app\\exports\\search-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "")}.csv`;
+    const cur = settings.displayCurrency;
+    const lines = r.results.filter((x) => x.match.verdict !== "mismatch" && !x.feedback).slice(0, 15).map((x, i) => {
+      const p = P(x.platformId);
+      return `${i + 1}. ${p?.name ?? x.platformId} ${p?.edition ?? ""} | ${x.title.slice(0, 50)} | 到手 ${cur} ${(x.displayLanded ?? x.displayPrice ?? 0).toFixed(2)} | 标价 ${x.currency} ${x.price?.toFixed(2) ?? "-"} | ${x.deal?.label ?? ""}\n   ${x.url}`;
+    });
+    return `【Hawwwker 比价】${r.summary.instruction}\n${r.aiSummary ? "结论：" + r.aiSummary.headline + "\n" : ""}（到手价已换算为 ${cur}，含运费与券后价）\n\n${lines.join("\n")}\n`;
+  },
+  ai_detect_local: async (): Promise<LocalAi> => {
+    await sleep(500);
+    return params.has("ollama") ? { found: true, baseUrl: "http://localhost:11434/v1", models: ["qwen3:8b", "llama3.2:3b"] } : { found: false, baseUrl: "", models: [] };
+  },
+  platforms_recommend: ({ timezone, language }): Recommendation => {
+    const tz = String(timezone ?? "").toLowerCase();
+    const zh = String(language ?? "").toLowerCase().startsWith("zh");
+    const cn = ["taobao", "jd", "pinduoduo", "xianyu"];
+    let rec: Recommendation;
+    if (tz.startsWith("asia/shanghai")) rec = { region: "cn", ids: ["taobao", "jd", "pinduoduo", "xianyu", "xiaohongshu", "douyin"], reason: "你在中国大陆：推荐国内主流电商与种草平台" };
+    else if (/europe\/(berlin|vienna|zurich)/.test(tz)) rec = { region: "all", ids: ["amazon_de", "ebay_de", "idealo", "kleinanzeigen"], reason: "你在德语区：推荐 Amazon.de、eBay.de、idealo 比价与 Kleinanzeigen 二手，并保留国内平台" };
+    else if (tz.startsWith("america/")) rec = { region: "all", ids: ["amazon_com", "ebay_com", "walmart", "bestbuy"], reason: "你在美洲：推荐 Amazon.com、eBay、Walmart、Best Buy，并保留国内平台" };
+    else rec = { region: "all", ids: ["amazon_com", "aliexpress", "temu"], reason: "推荐通用国际站点，并保留国内平台" };
+    if (rec.region !== "cn" && zh) rec.ids.push(...cn);
+    rec.ids = rec.ids.filter((id) => P(id));
+    return rec;
+  },
+  platform_selftest: async ({ ids }): Promise<SelfTestResult[]> => {
+    const list = ((ids as string[]) ?? []).slice(0, 12);
+    await sleep(1500 + list.length * 400);
+    return list.map((id) => {
+      const p = P(id);
+      const st = logins.find((l) => l.platformId === id);
+      const ms = 3000 + (hash(id) % 9000);
+      if (p?.login === "required" && st?.status !== "logged_in") return { platformId: id, ok: false, count: 0, withPrice: 0, samples: [], ms, loginRequired: true, message: `${p.name} 需要登录：到「账号与登录」登录一次即可` };
+      const n = 8 + (hash(id) % 12);
+      const price = round(fxConvert(899, "CNY", p?.currency ?? "CNY"), p?.currency ?? "CNY");
+      return { platformId: id, ok: true, count: n, withPrice: n - (hash(id) % 3), ms, loginRequired: false, message: null,
+        samples: [{ title: p?.region === "cn" ? "蓝牙耳机 主动降噪 长续航" : "Bluetooth Headphones Noise Cancelling", price, currency: p?.currency ?? "CNY", landed: price, url: (p?.home ?? "") + "item/1" }] };
+    });
   },
 
   copilot_skills: () => SKILLS,

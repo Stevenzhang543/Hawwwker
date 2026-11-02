@@ -84,6 +84,16 @@ const MIGRATIONS: &[&str] = &[
         prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS ai_cache(key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT NOT NULL);
     "#,
+    // v2（v26.02）：到手价、商户售价、外部链接、"不相关"反馈
+    r#"
+    ALTER TABLE listings ADD COLUMN shipping REAL;
+    ALTER TABLE listings ADD COLUMN coupon_price REAL;
+    ALTER TABLE watches ADD COLUMN my_price REAL;
+    ALTER TABLE notices ADD COLUMN url TEXT NOT NULL DEFAULT '';
+    CREATE TABLE IF NOT EXISTS feedback(
+        platform_id TEXT NOT NULL, external_id TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(platform_id, external_id, scope));
+    "#,
 ];
 
 impl Db {

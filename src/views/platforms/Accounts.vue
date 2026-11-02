@@ -11,7 +11,9 @@ import Icon from "@/components/ui/Icon.vue";
 const store = usePlatformStore();
 const ui = useUiStore();
 const region = ref<"all" | "cn" | "intl">("all");
-const onlyEnabled = ref(true);
+/** 默认只看已启用的平台；"待处理" = 需要/建议登录但未登录或已过期 */
+const scope = ref<"enabled" | "todo" | "all">("enabled");
+const q = ref("");
 const browser = ref<BrowserInfo | null>(null);
 const refreshing = ref(false);
 
@@ -23,11 +25,26 @@ onMounted(async () => {
   }
 });
 
+function needsAction(p: PlatformInfo): boolean {
+  const s = store.logins[p.id]?.status;
+  return s === "expired" || (s === "logged_out" && p.login !== "optional") || ["opening", "waiting", "verifying"].includes(store.logins[p.id]?.flow ?? "");
+}
+function matches(p: PlatformInfo): boolean {
+  if (region.value !== "all" && p.region !== region.value) return false;
+  if (scope.value === "enabled" && !p.enabled) return false;
+  if (scope.value === "todo" && !needsAction(p)) return false;
+  const k = q.value.trim().toLowerCase();
+  return !k || `${p.name}${p.edition}${p.familyName}${p.id}`.toLowerCase().includes(k);
+}
 const families = computed(() =>
-  store.families
-    .map((f) => ({ ...f, editions: f.editions.filter((p) => (region.value === "all" || p.region === region.value) && (!onlyEnabled.value || p.enabled)) }))
-    .filter((f) => f.editions.length),
+  store.families.map((f) => ({ ...f, editions: f.editions.filter(matches) })).filter((f) => f.editions.length),
 );
+const todoCount = computed(() => store.list.filter(needsAction).length);
+const scopeOpts = computed(() => [
+  { value: "enabled" as const, label: `已启用 ${store.list.filter((p) => p.enabled).length}` },
+  { value: "todo" as const, label: `待处理 ${todoCount.value}` },
+  { value: "all" as const, label: `全部 ${store.list.length}` },
+]);
 const stats = computed(() => {
   const ls = Object.values(store.logins);
   return {
@@ -104,13 +121,24 @@ const regionOpts = [
     </div>
 
     <div class="row wrap">
-      <span class="chip green"><Icon name="check" />已登录 {{ stats.ok }}</span>
-      <span class="chip orange"><Icon name="clock" />已过期 {{ stats.expired }}</span>
-      <span class="chip red"><Icon name="lock" />未登录 {{ stats.out }}</span>
-      <span class="spacer"></span>
-      <label class="row tiny faint" style="gap: 6px; cursor: pointer"><input v-model="onlyEnabled" type="checkbox" />只看已启用</label>
+      <GSegmented v-model="scope" :options="scopeOpts" small />
       <GSegmented v-model="region" :options="regionOpts" small />
+      <div class="searchbox">
+        <Icon name="search" :size="14" class="faint" />
+        <input v-model="q" placeholder="找平台…" aria-label="搜索平台" />
+        <button v-if="q" class="icon-btn" title="清除" @click="q = ''"><Icon name="x" :size="13" /></button>
+      </div>
+      <span class="spacer"></span>
+      <span class="faint tiny stat-line" :title="`已登录 ${stats.ok} · 已过期 ${stats.expired} · 未登录 ${stats.out}`">
+        <span class="dot green"></span>{{ stats.ok }}<span class="dot orange"></span>{{ stats.expired }}<span class="dot red"></span>{{ stats.out }}
+      </span>
       <button class="btn sm" :disabled="refreshing" @click="refresh"><Icon name="refresh" :class="{ spin: refreshing }" />刷新状态</button>
+    </div>
+
+    <div v-if="!families.length" class="empty glass">
+      <div class="empty-icon"><Icon name="key" /></div>
+      <h3>{{ scope === "todo" ? "没有需要处理的登录" : "没有符合条件的平台" }}</h3>
+      <p v-if="scope !== 'all'">切换到「全部」查看所有 {{ store.list.length }} 个平台，或到「平台目录」启用更多平台。</p>
     </div>
 
     <div class="fam-grid">
@@ -181,6 +209,14 @@ const regionOpts = [
       <div class="kv">
         <span>浏览器</span><code class="selectable">{{ browser?.executable ?? "未找到 Edge / Chrome，请先安装其中之一" }}</code>
         <span>会话目录</span><code class="selectable">{{ browser?.profileDir ?? "—" }}</code>
+        <template v-if="browser?.transport">
+        <span>通信方式</span>
+        <span>
+          <span class="chip" :class="browser?.transport === 'port' ? 'orange' : 'green'">
+            <Icon :name="browser?.transport === 'port' ? 'warn' : 'shield'" />{{ browser?.transport === "port" ? "本地端口（回退模式）" : "管道通信 · 不开放端口" }}
+          </span>
+        </span>
+        </template>
       </div>
       <p class="faint tiny" style="margin-top: 10px">
         登录由你本人在官网完成，Hawwwker 拿不到密码；遇到验证码或安全验证时会把窗口移到屏幕上等你处理，不做任何绕过。退出某个平台只删除该平台的会话，不影响其他平台。
@@ -190,6 +226,37 @@ const regionOpts = [
 </template>
 
 <style scoped>
+.searchbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 4px 0 10px;
+  border-radius: 10px;
+  border: 1px solid var(--field-border);
+  background: var(--field);
+  width: 180px;
+}
+.searchbox input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 12.5px;
+}
+.searchbox .icon-btn {
+  width: 24px;
+  height: 24px;
+}
+.stat-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.stat-line .dot {
+  margin-left: 6px;
+}
 .fam-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));

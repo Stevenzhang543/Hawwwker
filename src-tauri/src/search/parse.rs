@@ -55,6 +55,18 @@ pub struct Candidate {
     /// 0~1：规则解析的把握
     pub confidence: f32,
     pub query: String,
+    /// 运费（0 = 包邮/免运费；None = 未知），与 price 同币种
+    pub shipping: Option<f64>,
+    /// 券后 / 满减后 / 优惠后价格
+    pub coupon_price: Option<f64>,
+}
+
+impl Candidate {
+    /// 到手价 = （券后价或标价）+ 运费
+    pub fn landed(&self) -> Option<f64> {
+        let base = self.coupon_price.or(self.price)?;
+        Some(((base + self.shipping.unwrap_or(0.0)) * 100.0).round() / 100.0)
+    }
 }
 
 /// 数字解析：根据 locale 判断 `.`/`,` 是千分位还是小数点；兼容 `1.299,00` `1,299.00` `1 299,00` `12.5万`。
@@ -108,7 +120,9 @@ pub fn parse_number(raw: &str, locale: &str) -> Option<f64> {
 static PRICE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(US\s?\$|C\$|A\$|HK\$|S\$|\$|€|£|¥|￥|EUR|USD|GBP|JPY|CNY|RMB)\s?(\d{1,3}(?:[.,\s\u{a0}]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)|(\d{1,3}(?:[.,\s\u{a0}]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s?(€|EUR|元|円|£|\$|USD|GBP|JPY|kr)").unwrap()
 });
-static COUPON_AFTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(?:券|元券|减|off|Rabatt|coupon|Coupon|/\s*(?:Monat|month|月|kg|l|100\s?g|Stück))").unwrap());
+static COUPON_AFTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:券|元券|减|off|Rabatt|coupon|Coupon|/\s*(?:Monat|month|月|kg|l|100\s?g|Stück)|(?i:shipping|delivery|Versand|Lieferung|livraison|送料|运费|邮费))").unwrap()
+});
 static COUPON_BEFORE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:满|减|券|省|Spare|Save|save|spare|coupon|Coupon|Rabatt|Versand|shipping|Lieferung|运费)\s*$").unwrap());
 
 fn currency_code(sym: &str, platform: &Platform) -> String {
@@ -230,6 +244,73 @@ fn short_hash(s: &str) -> String {
     format!("t{}", hex::encode(&d[..6]))
 }
 
+static FREE_SHIP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)包邮|免运费|运费\s*[:：]?\s*[¥￥]?\s*0(?:\.0+)?(?:元)?(?:\D|$)|free (?:shipping|delivery)|kostenlose[rn]? (?:Versand|Lieferung)|gratis[- ]?(?:versand|lieferung)|versandkostenfrei|livraison gratuite|送料無料").unwrap()
+});
+static SHIP_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)shipping|delivery|Versand|Lieferung|livraison|送料|运费|邮费").unwrap());
+static COUPON_FIXED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:券后价?|到手价|折后价?|活动价|补贴后)\s*[:：]?\s*[¥￥]?\s*(\d+(?:\.\d+)?)").unwrap()
+});
+static COUPON_PCT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:save|spare|sparen?)\s*(\d{1,2})\s*%\s*(?:with coupon|mit (?:coupon|gutschein))|(\d{1,2})\s*%\s*(?:coupon|gutschein)").unwrap()
+});
+static COUPON_FULL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"满\s*(\d+)\s*(?:元)?\s*减\s*(\d+)").unwrap());
+
+/// 不做"券/运费"过滤的原始价格抽取（用于识别运费金额本身）。
+fn raw_prices(text: &str, platform: &Platform) -> Vec<PriceHit> {
+    PRICE_RE
+        .captures_iter(text)
+        .filter_map(|c| {
+            let (sym, num) = if let Some(n) = c.get(2) { (c.get(1)?.as_str(), n.as_str()) } else { (c.get(4)?.as_str(), c.get(3)?.as_str()) };
+            parse_number(num, &platform.locale).map(|v| PriceHit { value: v, currency: currency_code(sym, platform) })
+        })
+        .collect()
+}
+
+/// 运费：包邮/免运费 → 0；"+ 4,99 € Versand" / "运费 ¥8" → 金额；未知 → None。
+pub fn shipping_of(lines: &[String], platform: &Platform, price: Option<f64>, currency: &str) -> Option<f64> {
+    let all = lines.join("\n");
+    if FREE_SHIP.is_match(&all) {
+        return Some(0.0);
+    }
+    for l in lines {
+        if !SHIP_WORD.is_match(l) {
+            continue;
+        }
+        if let Some(hit) = raw_prices(l, platform).into_iter().find(|h| h.currency == currency) {
+            if hit.value > 0.0 && price.is_none_or(|p| hit.value < p) && hit.value < 200.0 {
+                return Some(hit.value);
+            }
+        }
+    }
+    None
+}
+
+/// 券后价：明确的"券后/到手价"金额 > 百分比券 > 满减（满足门槛时）。
+pub fn coupon_of(text: &str, price: Option<f64>) -> Option<f64> {
+    let p = price?;
+    let round = |x: f64| (x * 100.0).round() / 100.0;
+    if let Some(v) = COUPON_FIXED.captures(text).and_then(|c| c[1].parse::<f64>().ok()) {
+        if v > 0.0 && v < p {
+            return Some(round(v));
+        }
+    }
+    if let Some(pct) = COUPON_PCT.captures(text).and_then(|c| c.get(1).or(c.get(2))).and_then(|m| m.as_str().parse::<f64>().ok()) {
+        if pct > 0.0 && pct < 90.0 {
+            return Some(round(p * (1.0 - pct / 100.0)));
+        }
+    }
+    let mut best: Option<f64> = None;
+    for c in COUPON_FULL.captures_iter(text) {
+        if let (Ok(th), Ok(minus)) = (c[1].parse::<f64>(), c[2].parse::<f64>()) {
+            if p >= th && minus < p {
+                best = Some(best.map_or(p - minus, |b: f64| b.min(p - minus)));
+            }
+        }
+    }
+    best.map(round)
+}
+
 pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Candidate> {
     let lines = merge_lines(&raw.lines);
     if lines.is_empty() {
@@ -257,6 +338,9 @@ pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Can
         None => (None, platform.currency.clone()),
     };
     let original_price = original.filter(|o| price.is_none_or(|p| *o > p));
+    let line_texts: Vec<String> = lines.iter().map(|l| l.t.clone()).collect();
+    let shipping = shipping_of(&line_texts, platform, price, &currency);
+    let coupon_price = coupon_of(&text, price);
 
     // 标题：title 属性 > 链接文字最长行 > 字号最大的长行 > 最长行
     let ok = |t: &str| !is_junk(t, platform) && t.chars().count() >= 4;
@@ -349,6 +433,8 @@ pub fn parse_card(platform: &Platform, raw: &RawCard, query: &str) -> Option<Can
         text: text.chars().take(600).collect(),
         confidence: confidence.min(1.0),
         query: query.to_string(),
+        shipping,
+        coupon_price,
     })
 }
 
@@ -434,6 +520,32 @@ mod tests {
         assert_eq!(c.original_price, Some(419.0));
         assert_eq!(c.rating, Some(4.5));
         assert!(c.is_ad);
+    }
+
+    #[test]
+    fn landed_price_parts() {
+        let de = plat("amazon_de");
+        let raw = RawCard {
+            id: "B0X".into(),
+            lines: vec![
+                RawLine { t: "Kaffeemühle elektrisch".into(), fs: 15.0, fw: 400.0, a: true, s: false },
+                RawLine { t: "39,99 €".into(), fs: 22.0, fw: 700.0, a: false, s: false },
+                l("+ 4,99 € Versand", 11.0),
+                l("Spare 10 % mit Coupon", 11.0),
+            ],
+            ..Default::default()
+        };
+        let c = parse_card(&de, &raw, "x").unwrap();
+        assert_eq!(c.price, Some(39.99), "shipping line must not become the price");
+        assert_eq!(c.shipping, Some(4.99));
+        assert_eq!(c.coupon_price, Some(35.99));
+        assert_eq!(c.landed(), Some(40.98));
+        let tb = plat("taobao");
+        let raw = RawCard { id: "1".into(), lines: vec![l("索尼耳机 官方正品", 14.0), l("¥1899", 20.0), l("券后¥1799", 12.0), l("包邮", 11.0)], ..Default::default() };
+        let c = parse_card(&tb, &raw, "x").unwrap();
+        assert_eq!((c.price, c.coupon_price, c.shipping), (Some(1899.0), Some(1799.0), Some(0.0)));
+        assert_eq!(coupon_of("满300减40", Some(329.0)), Some(289.0));
+        assert_eq!(coupon_of("满300减40", Some(199.0)), None);
     }
 
     #[test]

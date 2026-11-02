@@ -1,15 +1,17 @@
 //! 自动化浏览器：启动 / 复用本机 Edge 或 Chrome（独立用户目录，登录会话只保存在本机）、标签页、窗口显示、Cookie。
 //!
-//! 修复 v3.4：
-//! - 窗口显示改为"可见标签集合"，不再用全局计数（登录超时后窗口永远留在屏幕上）。
-//! - 退出单个平台只删除该平台域名下的 Cookie（不再清空全部再写回）。
-//! - 不再使用 `--remote-allow-origins=*`：本程序的 websocket 客户端不带 Origin 头，网页无法接入调试端口。
+//! v26.02：
+//! - 默认通过 `--remote-debugging-pipe` 通信，不开端口；管道启动失败时才回退到 127.0.0.1 随机端口。
+//! - 所有标签页通过浏览器级连接上的 flatten session 访问（Target.createTarget / attachToTarget），不再依赖 HTTP 端点。
+//! - 浏览器与本程序同生共死（Windows 作业对象 / Linux PDEATHSIG），不会遗留进程。
+//!
+//! 沿用：窗口显示用"可见标签集合"；退出单个平台只删除该平台域名下的 Cookie；登录页不接入、不执行脚本。
 
 use super::cdp::Conn;
+use super::launch::{self, Proc};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
@@ -17,18 +19,18 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 pub const OFFSCREEN: (i64, i64) = (-32000, -32000);
 const PERSIST_DAYS: f64 = 30.0;
+const T: Duration = Duration::from_secs(15);
 
 #[derive(Default)]
 struct Inner {
-    port: Option<u16>,
-    child: Option<Child>,
+    proc: Option<Proc>,
     conn: Option<Arc<Conn>>,
+    port: Option<u16>,
 }
 
 pub struct Browser {
     inner: Mutex<Inner>,
     profile: PathBuf,
-    http: reqwest::Client,
     background: RwLock<bool>,
     headless: bool,
     lang: RwLock<String>,
@@ -38,6 +40,7 @@ pub struct Browser {
     fail: StdMutex<Option<(Instant, String)>>,
     executable: RwLock<Option<String>>,
     wiping: AtomicBool,
+    transport: RwLock<&'static str>,
 }
 
 /// 标签守卫：搜索被取消或超时导致 future 被丢弃时，仍然关闭标签（修复标签泄漏、窗口留在屏幕上）。
@@ -68,18 +71,27 @@ impl Drop for TabGuard {
 
 pub struct Tab {
     pub id: String,
+    session: String,
     conn: Arc<Conn>,
 }
 
 impl Tab {
+    pub async fn send(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.conn.send_to(Some(&self.session), method, params, Duration::from_secs(20)).await
+    }
+
     pub async fn eval(&self, expr: &str, timeout: Duration) -> Result<Value, String> {
         let res = self
             .conn
-            .send("Runtime.evaluate", json!({"expression": expr, "returnByValue": true, "awaitPromise": true}), timeout)
+            .send_to(Some(&self.session), "Runtime.evaluate", json!({"expression": expr, "returnByValue": true, "awaitPromise": true}), timeout)
             .await?;
         if let Some(ex) = res.get("exceptionDetails") {
-            let text = ex.get("exception").and_then(|e| e.get("description")).and_then(|d| d.as_str())
-                .or_else(|| ex.get("text").and_then(|t| t.as_str())).unwrap_or("页面脚本执行失败");
+            let text = ex
+                .get("exception")
+                .and_then(|e| e.get("description"))
+                .and_then(|d| d.as_str())
+                .or_else(|| ex.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("页面脚本执行失败");
             return Err(format!("页面脚本执行失败：{}", text.chars().take(160).collect::<String>()));
         }
         Ok(res.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null))
@@ -98,10 +110,6 @@ impl Tab {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-    }
-
-    pub async fn send(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.conn.send(method, params, Duration::from_secs(20)).await
     }
 }
 
@@ -153,13 +161,18 @@ pub fn domain_match(cookie_domain: &str, suffixes: &[String]) -> bool {
     suffixes.iter().any(|s| d == *s || d.ends_with(&format!(".{s}")))
 }
 
+async fn http_json(port: u16, path: &str) -> Result<Value, String> {
+    let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().map_err(|e| e.to_string())?;
+    let resp = client.get(format!("http://127.0.0.1:{port}{path}")).send().await.map_err(|e| e.to_string())?;
+    resp.json::<Value>().await.map_err(|e| e.to_string())
+}
+
 impl Browser {
     pub fn new(profile: PathBuf) -> Self {
         let headless = std::env::var("HAWWWKER_HEADLESS").map(|v| v == "1").unwrap_or(false);
         Browser {
             inner: Mutex::new(Inner::default()),
             profile,
-            http: reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(10)).build().unwrap_or_default(),
             background: RwLock::new(true),
             headless,
             lang: RwLock::new("zh-CN".into()),
@@ -169,6 +182,7 @@ impl Browser {
             fail: StdMutex::new(None),
             executable: RwLock::new(None),
             wiping: AtomicBool::new(false),
+            transport: RwLock::new("pipe"),
         }
     }
 
@@ -183,6 +197,11 @@ impl Browser {
 
     pub fn profile_dir(&self) -> &Path {
         &self.profile
+    }
+
+    /// 当前通信方式：pipe（管道，无端口）或 port（回退）。
+    pub fn transport(&self) -> &'static str {
+        self.transport.read().map(|t| *t).unwrap_or("pipe")
     }
 
     pub fn executable(&self) -> Option<String> {
@@ -202,28 +221,11 @@ impl Browser {
         sem.acquire_owned().await.ok()
     }
 
-    async fn port(&self) -> Option<u16> {
-        self.inner.lock().await.port
-    }
-
-    async fn http_json(&self, port: u16, method: reqwest::Method, path: &str) -> Result<Value, String> {
-        let resp = self
-            .http
-            .request(method, format!("http://127.0.0.1:{port}{path}"))
-            .send()
-            .await
-            .map_err(|e| format!("DevTools 请求失败：{e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("DevTools HTTP {}", resp.status()));
-        }
-        let text = resp.text().await.map_err(|e| e.to_string())?;
-        Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))
-    }
-
     pub async fn alive(&self) -> bool {
-        match self.port().await {
-            Some(p) => self.http_json(p, reqwest::Method::GET, "/json/version").await.is_ok(),
-            None => false,
+        let conn = self.inner.lock().await.conn.clone();
+        match conn {
+            Some(c) if !c.is_closed() => c.send("Browser.getVersion", json!({}), Duration::from_secs(5)).await.is_ok(),
+            _ => false,
         }
     }
 
@@ -247,8 +249,8 @@ impl Browser {
             return Err("正在清除登录数据，请稍候".into());
         }
         let mut inner = self.inner.lock().await;
-        if let (Some(port), Some(conn)) = (inner.port, inner.conn.clone()) {
-            if !conn.is_closed() && self.http_json(port, reqwest::Method::GET, "/json/version").await.is_ok() {
+        if let Some(conn) = inner.conn.clone() {
+            if !conn.is_closed() && conn.send("Browser.getVersion", json!({}), Duration::from_secs(5)).await.is_ok() {
                 return Ok(conn);
             }
         }
@@ -257,68 +259,82 @@ impl Browser {
                 return Err(msg);
             }
         }
-        // 已有端口但连接断开：尝试重连
-        if let Some(port) = inner.port {
-            if let Ok(info) = self.http_json(port, reqwest::Method::GET, "/json/version").await {
-                if let Some(ws) = info.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
-                    if let Ok(conn) = Conn::connect(ws).await {
-                        inner.conn = Some(conn.clone());
-                        return Ok(conn);
-                    }
-                }
-            }
+        if let Some(mut p) = inner.proc.take() {
+            p.kill();
         }
-        // 上次异常退出遗留的浏览器仍占用用户目录：按 DevToolsActivePort 重新接入，而不是再启动一个（否则会被转交给旧实例而超时）
-        if let Some(port) = std::fs::read_to_string(self.profile.join("DevToolsActivePort")).ok().and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u16>().ok())) {
-            if let Ok(info) = self.http_json(port, reqwest::Method::GET, "/json/version").await {
-                if let Some(ws) = info.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
-                    if let Ok(conn) = Conn::connect(ws).await {
-                        log::info!("reattached to running browser on port {port}");
-                        inner.port = Some(port);
-                        inner.conn = Some(conn.clone());
-                        return Ok(conn);
-                    }
-                }
-            }
+        inner.conn = None;
+        inner.port = None;
+        // 端口模式下遗留的浏览器（旧版本 / 回退模式）：按 DevToolsActivePort 重新接入
+        if let Some(conn) = self.reattach_port(&mut inner).await {
+            return Ok(conn);
         }
-        match self.launch(&mut inner).await {
-            Ok(c) => {
+        let res = match self.launch(&mut inner, std::env::var("HAWWWKER_CDP").map(|v| v != "port").unwrap_or(true)).await {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                log::warn!("pipe launch failed ({e}), falling back to port mode");
+                if let Some(mut p) = inner.proc.take() {
+                    p.kill();
+                }
+                self.launch(&mut inner, false).await
+            }
+        };
+        match &res {
+            Ok(_) => {
                 if let Ok(mut f) = self.fail.lock() {
                     *f = None;
                 }
-                Ok(c)
             }
             Err(e) => {
                 if let Ok(mut f) = self.fail.lock() {
                     *f = Some((Instant::now(), e.clone()));
                 }
-                Err(e)
             }
         }
+        res
     }
 
-    async fn launch(&self, inner: &mut Inner) -> Result<Arc<Conn>, String> {
+    async fn reattach_port(&self, inner: &mut Inner) -> Option<Arc<Conn>> {
+        let port = std::fs::read_to_string(self.profile.join("DevToolsActivePort")).ok()?.lines().next()?.trim().parse::<u16>().ok()?;
+        let info = http_json(port, "/json/version").await.ok()?;
+        let ws = info.get("webSocketDebuggerUrl")?.as_str()?;
+        let conn = Conn::connect_ws(ws).await.ok()?;
+        log::info!("reattached to running browser on port {port}");
+        inner.port = Some(port);
+        inner.conn = Some(conn.clone());
+        if let Ok(mut t) = self.transport.write() {
+            *t = "port";
+        }
+        Some(conn)
+    }
+
+    async fn launch(&self, inner: &mut Inner, pipe: bool) -> Result<Arc<Conn>, String> {
         let exe = self.executable().ok_or("没有找到 Edge 或 Chrome 浏览器，请先安装其中之一")?;
         std::fs::create_dir_all(&self.profile).map_err(|e| format!("无法创建浏览器目录：{e}"))?;
         self.prepare_profile();
-        let port = free_port().ok_or("没有可用的本地端口")?;
+        let _ = std::fs::remove_file(self.profile.join("DevToolsActivePort"));
         let lang = self.lang.read().map(|l| l.clone()).unwrap_or_else(|_| "zh-CN".into());
+        let port = if pipe { None } else { Some(free_port().ok_or("没有可用的本地端口")?) };
         let mut args = vec![
-            format!("--remote-debugging-port={port}"),
-            "--remote-debugging-address=127.0.0.1".into(),
             format!("--user-data-dir={}", self.profile.display()),
             "--no-first-run".into(),
             "--no-default-browser-check".into(),
             "--disable-session-crashed-bubble".into(),
             "--hide-crash-restore-bubble".into(),
             "--window-size=1280,900".into(),
+            format!("--lang={lang}"),
             // 窗口在屏幕外时不要被系统判定为"被遮挡"而降频（否则懒加载与无限滚动不触发）
             "--disable-backgrounding-occluded-windows".into(),
             "--disable-renderer-backgrounding".into(),
             "--disable-background-timer-throttling".into(),
             "--disable-features=CalculateNativeWinOcclusion".into(),
-            format!("--lang={lang}"),
         ];
+        match port {
+            None => args.push("--remote-debugging-pipe".into()),
+            Some(p) => {
+                args.push(format!("--remote-debugging-port={p}"));
+                args.push("--remote-debugging-address=127.0.0.1".into());
+            }
+        }
         let background = self.background.read().map(|b| *b).unwrap_or(true);
         if self.headless {
             args.push("--headless=new".into());
@@ -327,30 +343,54 @@ impl Browser {
             args.push(format!("--window-position={},{}", OFFSCREEN.0, OFFSCREEN.1));
         }
         args.push("about:blank".into());
-        log::info!("launch browser {exe} (background={background})");
-        let mut cmd = Command::new(&exe);
-        cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        let child = cmd.spawn().map_err(|e| format!("启动浏览器失败：{e}"))?;
-        inner.child = Some(child);
-        inner.port = Some(port);
-        for _ in 0..100 {
-            if let Ok(info) = self.http_json(port, reqwest::Method::GET, "/json/version").await {
-                if let Some(ws) = info.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
-                    let conn = Conn::connect(ws).await?;
-                    inner.conn = Some(conn.clone());
-                    if let Ok(mut v) = self.visible.lock() {
-                        v.clear();
+        log::info!("launch browser {exe} (transport={}, background={background})", if pipe { "pipe" } else { "port" });
+        let (proc, pipe_conn) = launch::spawn(&exe, &args, pipe)?;
+        inner.proc = Some(proc);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let conn = match pipe_conn {
+            Some(conn) => {
+                // 管道模式：等待浏览器在管道上响应
+                loop {
+                    if conn.send("Browser.getVersion", json!({}), Duration::from_secs(3)).await.is_ok() {
+                        break conn;
                     }
-                    return Ok(conn);
+                    let exited = inner.proc.as_mut().map(|p| p.exited()).unwrap_or(true);
+                    if exited || conn.is_closed() || Instant::now() > deadline {
+                        return Err(if exited {
+                            "浏览器启动后立即退出（可能已有同一目录的浏览器在运行）".into()
+                        } else {
+                            "浏览器没有在管道上响应".into()
+                        });
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            None => {
+                let port = port.unwrap_or_default();
+                loop {
+                    if let Ok(info) = http_json(port, "/json/version").await {
+                        if let Some(ws) = info.get("webSocketDebuggerUrl").and_then(|w| w.as_str()) {
+                            break Conn::connect_ws(ws).await?;
+                        }
+                    }
+                    if Instant::now() > deadline {
+                        if let Some(mut p) = inner.proc.take() {
+                            p.kill();
+                        }
+                        return Err("浏览器启动超时（20 秒），请关闭所有 Edge/Chrome 窗口后重试".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
+        inner.conn = Some(conn.clone());
+        inner.port = port;
+        if let Ok(mut t) = self.transport.write() {
+            *t = if pipe { "pipe" } else { "port" };
         }
-        if let Some(mut c) = inner.child.take() {
-            let _ = c.kill();
+        if let Ok(mut v) = self.visible.lock() {
+            v.clear();
         }
-        inner.port = None;
-        Err("浏览器启动超时（20 秒），请关闭所有 Edge/Chrome 窗口后重试".into())
+        Ok(conn)
     }
 
     /* ------------------------------------------------------------ 标签页 */
@@ -374,66 +414,70 @@ impl Browser {
         }
     }
 
-    async fn create_target(&self, url: &str) -> Result<Value, String> {
-        self.ensure().await?;
-        let port = self.port().await.ok_or("浏览器未启动")?;
-        let enc = urlencoding::encode(url).into_owned();
-        match self.http_json(port, reqwest::Method::PUT, &format!("/json/new?{enc}")).await {
-            Ok(v) if v.get("id").is_some() => Ok(v),
-            _ => self.http_json(port, reqwest::Method::GET, &format!("/json/new?{enc}")).await,
-        }
+    async fn create_target(&self, url: &str) -> Result<String, String> {
+        let conn = self.ensure().await?;
+        let r = conn.send("Target.createTarget", json!({"url": url}), T).await?;
+        r.get("targetId").and_then(|x| x.as_str()).map(|s| s.to_string()).ok_or_else(|| "无法创建标签页".into())
     }
 
     pub async fn new_tab(&self, url: &str, throttle: bool) -> Result<Tab, String> {
         if throttle {
             self.pace(url, Duration::from_millis(3000)).await;
         }
-        let info = self.create_target(url).await?;
-        let id = info.get("id").and_then(|x| x.as_str()).ok_or("无法创建标签页")?.to_string();
-        let ws = info.get("webSocketDebuggerUrl").and_then(|x| x.as_str()).ok_or("无法接入标签页")?.to_string();
-        let conn = match Conn::connect(&ws).await {
-            Ok(c) => c,
+        let id = self.create_target(url).await?;
+        let conn = self.ensure().await?;
+        let session = match conn.send("Target.attachToTarget", json!({"targetId": id, "flatten": true}), T).await {
+            Ok(r) => r.get("sessionId").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             Err(e) => {
                 self.close_target(&id).await;
                 return Err(e);
             }
         };
-        let tab = Tab { id, conn };
+        if session.is_empty() {
+            self.close_target(&id).await;
+            return Err("无法接入标签页".into());
+        }
+        let tab = Tab { id, session, conn };
         tab.ready(Duration::from_secs(12)).await;
         Ok(tab)
     }
 
-    /// 打开官网登录页：普通标签页，不接入、不执行脚本，只把窗口移到屏幕上。
+    /// 打开官网登录页：普通标签页，不接入、不执行任何脚本，只把窗口移到屏幕上。
     pub async fn open_plain(&self, url: &str) -> Result<String, String> {
-        let info = self.create_target(url).await?;
-        let id = info.get("id").and_then(|x| x.as_str()).ok_or("无法创建标签页")?.to_string();
+        let id = self.create_target(url).await?;
         self.show(&id).await;
         Ok(id)
     }
 
     pub async fn close_tab(&self, tab: Tab) {
-        tab.conn.close();
-        self.hide(&tab.id).await;
+        let _ = tab.conn.send("Target.detachFromTarget", json!({"sessionId": tab.session}), Duration::from_secs(3)).await;
         self.close_target(&tab.id).await;
     }
 
     pub async fn close_target(&self, id: &str) {
         self.hide(id).await;
-        if let Some(port) = self.port().await {
-            let _ = self.http_json(port, reqwest::Method::GET, &format!("/json/close/{id}")).await;
+        let conn = self.inner.lock().await.conn.clone();
+        if let Some(c) = conn.filter(|c| !c.is_closed()) {
+            let _ = c.send("Target.closeTarget", json!({"targetId": id}), Duration::from_secs(5)).await;
         }
     }
 
     /// 只读列出标签页（不接入页面）：[(id, url)]
     pub async fn targets(&self) -> Vec<(String, String)> {
-        let Some(port) = self.port().await else { return vec![] };
-        match self.http_json(port, reqwest::Method::GET, "/json/list").await {
-            Ok(Value::Array(a)) => a
-                .into_iter()
-                .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
-                .filter_map(|t| Some((t.get("id")?.as_str()?.to_string(), t.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string())))
-                .collect(),
-            _ => vec![],
+        let conn = self.inner.lock().await.conn.clone();
+        let Some(c) = conn.filter(|c| !c.is_closed()) else { return vec![] };
+        match c.send("Target.getTargets", json!({}), Duration::from_secs(5)).await {
+            Ok(r) => r
+                .get("targetInfos")
+                .and_then(|a| a.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
+                        .filter_map(|t| Some((t.get("targetId")?.as_str()?.to_string(), t.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => vec![],
         }
     }
 
@@ -472,7 +516,6 @@ impl Browser {
         };
         let background = self.background.read().map(|b| *b).unwrap_or(true);
         if now_empty && background {
-            // 窗口可能已随标签关闭；挑一个仍存在的标签来定位窗口
             let any = self.targets().await.into_iter().map(|(id, _)| id).find(|id| id != target_id);
             if let Some(id) = any {
                 self.set_window(&id, false).await;
@@ -485,7 +528,7 @@ impl Browser {
         self.ensure().await?;
         let id = match self.targets().await.into_iter().next() {
             Some((id, _)) => id,
-            None => self.create_target("about:blank").await?.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            None => self.create_target("about:blank").await?,
         };
         self.show(&id).await;
         Ok(())
@@ -494,7 +537,7 @@ impl Browser {
     /* ------------------------------------------------------------ Cookie（只在本机浏览器内部处理） */
     pub async fn cookies(&self) -> Result<Vec<Value>, String> {
         let conn = self.ensure().await?;
-        let r = conn.send("Storage.getCookies", json!({}), Duration::from_secs(15)).await?;
+        let r = conn.send("Storage.getCookies", json!({}), T).await?;
         Ok(r.get("cookies").and_then(|c| c.as_array()).cloned().unwrap_or_default())
     }
 
@@ -532,7 +575,7 @@ impl Browser {
         }
         if !fixed.is_empty() {
             let conn = self.ensure().await?;
-            conn.send("Storage.setCookies", json!({"cookies": fixed}), Duration::from_secs(15)).await?;
+            conn.send("Storage.setCookies", json!({"cookies": fixed}), T).await?;
         }
         Ok(fixed.len())
     }
@@ -568,17 +611,15 @@ impl Browser {
         let mut inner = self.inner.lock().await;
         if let Some(conn) = inner.conn.take() {
             let _ = conn.send("Browser.close", json!({}), Duration::from_secs(5)).await;
-            conn.close();
         }
-        if let Some(mut child) = inner.child.take() {
+        if let Some(mut p) = inner.proc.take() {
             for _ in 0..50 {
-                if let Ok(Some(_)) = child.try_wait() {
+                if p.exited() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            let _ = child.kill();
-            let _ = child.wait();
+            p.kill();
         }
         inner.port = None;
         if let Ok(mut v) = self.visible.lock() {
@@ -612,7 +653,7 @@ impl Browser {
 
     /// 启动时清理上次未删干净的旧目录。
     pub fn cleanup_trash(&self) {
-        if let (Some(parent), Some(_)) = (self.profile.parent(), self.profile.file_name()) {
+        if let Some(parent) = self.profile.parent() {
             if let Ok(rd) = std::fs::read_dir(parent) {
                 for e in rd.flatten() {
                     if e.file_name().to_string_lossy().starts_with("browser-profile-trash-") {

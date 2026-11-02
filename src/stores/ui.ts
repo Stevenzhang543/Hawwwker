@@ -26,6 +26,8 @@ export const useUiStore = defineStore("ui", () => {
   const copilotOpen = ref(false);
   const confirmReq = ref<ConfirmReq | null>(null);
   const sheets = ref(0);
+  /** 每个一级入口最近访问的二级页面（侧栏点一级入口时回到这里） */
+  const lastTab = ref<Record<string, string>>({});
   /** Esc 关闭栈：后注册的先关 */
   const escStack: (() => void)[] = [];
 
@@ -79,5 +81,5 @@ export const useUiStore = defineStore("ui", () => {
     return false;
   }
 
-  return { island, paletteOpen, copilotOpen, confirmReq, sheets, depth, toast, hideIsland, confirm, settleConfirm, pushEsc, popEsc };
+  return { island, paletteOpen, copilotOpen, confirmReq, sheets, lastTab, depth, toast, hideIsland, confirm, settleConfirm, pushEsc, popEsc };
 });

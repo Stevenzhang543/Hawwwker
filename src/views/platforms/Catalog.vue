@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { toAppError } from "@/api";
-import type { CustomPlatformInput, PlatformInfo } from "@/api/types";
+import { api, openExternal, toAppError } from "@/api";
+import type { CustomPlatformInput, PlatformInfo, SelfTestResult } from "@/api/types";
 import { KIND_LABEL, usePlatformStore } from "@/stores/platforms";
 import { useUiStore } from "@/stores/ui";
-import { CURRENCIES } from "@/utils/format";
+import { CURRENCIES, money } from "@/utils/format";
 import GSegmented from "@/components/ui/GSegmented.vue";
 import GSwitch from "@/components/ui/GSwitch.vue";
 import GSheet from "@/components/ui/GSheet.vue";
@@ -25,6 +25,44 @@ const rows = computed(() =>
   ),
 );
 const enabledCount = computed(() => store.list.filter((p) => p.enabled).length);
+
+/* ---------- 平台检测：在真实网络上做一次小搜索，看能否识别结果与价格 ---------- */
+const results = ref<Record<string, SelfTestResult>>({});
+const testing = ref<Set<string>>(new Set());
+const batch = ref<{ done: number; total: number } | null>(null);
+async function selftest(ids: string[]) {
+  const todo = ids.filter((id) => !testing.value.has(id));
+  if (!todo.length) return;
+  testing.value = new Set([...testing.value, ...todo]);
+  try {
+    for (let i = 0; i < todo.length; i += 12) {
+      const chunk = todo.slice(i, i + 12);
+      const out = await api.platformSelftest(chunk);
+      results.value = { ...results.value, ...Object.fromEntries(out.map((r) => [r.platformId, r])) };
+      const left = new Set(testing.value);
+      chunk.forEach((id) => left.delete(id));
+      testing.value = left;
+      if (batch.value) batch.value = { ...batch.value, done: Math.min(batch.value.total, batch.value.done + chunk.length) };
+    }
+  } catch (e) {
+    ui.toast(toAppError(e).message, "error", 4000);
+    const left = new Set(testing.value);
+    todo.forEach((id) => left.delete(id));
+    testing.value = left;
+  }
+}
+async function testEnabled() {
+  const ids = store.list.filter((p) => p.enabled).map((p) => p.id);
+  if (!ids.length) return ui.toast("还没有启用任何平台", "warn");
+  batch.value = { done: 0, total: ids.length };
+  await selftest(ids);
+  const res = ids.map((id) => results.value[id]).filter(Boolean) as SelfTestResult[];
+  const ok = res.filter((r) => r.ok).length;
+  const login = res.filter((r) => r.loginRequired).length;
+  ui.toast(`检测完成：${ok} / ${ids.length} 通过`, ok === ids.length ? "success" : "warn", 4200, login ? `${login} 个平台需要先登录` : undefined);
+  batch.value = null;
+}
+const secs = (ms: number) => (ms / 1000).toFixed(1) + "s";
 
 async function toggle(p: PlatformInfo, v: boolean) {
   try {
@@ -77,9 +115,12 @@ const LOGIN_NEED = { required: "必须登录", recommended: "建议登录", opti
     <div class="page-head">
       <div>
         <h1>平台目录</h1>
-        <p>选择要参与搜索的平台与站点版本。国际站搜索规则为 Beta，网站改版时可直接修改搜索地址模板。</p>
+        <p>选择参与搜索的平台与站点版本；「检测」会在真实网络上做一次小搜索，确认能识别结果与价格。网站改版时可修改搜索地址模板。</p>
       </div>
       <span class="spacer"></span>
+      <button v-ripple class="btn" :disabled="!!batch" title="对每个已启用平台做一次真实的小搜索，检查能否识别结果与价格" @click="testEnabled">
+        <Icon :name="batch ? 'refresh' : 'shield'" :class="{ spin: !!batch }" />{{ batch ? `检测中 ${batch.done}/${batch.total}` : "检测已启用平台" }}
+      </button>
       <button v-ripple class="btn primary" @click="adding = true"><Icon name="plus" />添加自定义平台</button>
     </div>
     <div class="row">
@@ -92,40 +133,64 @@ const LOGIN_NEED = { required: "必须登录", recommended: "建议登录", opti
     <section class="glass table-wrap">
       <table class="table">
         <thead>
-          <tr><th style="width: 60px">启用</th><th>平台</th><th>地区</th><th>类型</th><th>币种</th><th>登录</th><th>搜索地址模板</th><th></th></tr>
+          <tr><th style="width: 60px">启用</th><th>平台</th><th>检测</th><th class="r" style="width: 210px">操作</th></tr>
         </thead>
         <tbody>
-          <tr v-for="p in rows" :key="p.id" :class="{ off: !p.enabled }">
-            <td><GSwitch :model-value="p.enabled" small @update:model-value="(v: boolean) => toggle(p, v)" /></td>
-            <td>
-              <div class="row" style="gap: 10px">
-                <i class="glyph" :style="{ background: p.color }">{{ p.glyph }}</i>
-                <div class="col" style="gap: 0">
-                  <b>{{ p.name }}<span v-if="p.beta" class="chip orange beta">Beta</span><span v-if="p.custom" class="chip purple beta">自定义</span></b>
-                  <small class="faint">{{ p.edition }} · {{ p.familyName }}</small>
+          <template v-for="p in rows" :key="p.id">
+            <tr :class="{ off: !p.enabled }">
+              <td><GSwitch :model-value="p.enabled" small @update:model-value="(v: boolean) => toggle(p, v)" /></td>
+              <td>
+                <div class="row" style="gap: 10px">
+                  <i class="glyph" :style="{ background: p.color }">{{ p.glyph }}</i>
+                  <div class="col" style="gap: 1px; min-width: 0">
+                    <b>{{ p.name }}<span v-if="p.beta" class="chip orange beta">Beta</span><span v-if="p.custom" class="chip purple beta">自定义</span><span v-if="p.searchUrl !== p.defaultSearchUrl" class="chip amber beta">模板已修改</span></b>
+                    <small class="faint">
+                      <span :class="p.region === 'cn' ? 'cn' : 'intl'">{{ p.region === "cn" ? "国内版" : "国际版" }}</span> {{ p.country }}<template v-if="p.edition !== (p.region === 'cn' ? '国内版' : '国际版')"> · {{ p.edition }}</template> · {{ KIND_LABEL[p.kind] }} · {{ p.currency }} · {{ LOGIN_NEED[p.login] }}
+                    </small>
+                  </div>
                 </div>
-              </div>
-            </td>
-            <td><span class="chip" :class="p.region === 'cn' ? 'red' : 'blue'">{{ p.region === "cn" ? "国内版" : "国际版" }}</span> <small class="faint">{{ p.country }}</small></td>
-            <td class="faint">{{ KIND_LABEL[p.kind] }}</td>
-            <td class="num">{{ p.currency }}</td>
-            <td class="faint">{{ LOGIN_NEED[p.login] }}</td>
-            <td style="max-width: 380px">
-              <div v-if="editing === p.id" class="row" style="gap: 6px">
-                <input v-model="tpl" class="input sm mono" @keydown.enter="saveTpl(p)" @keydown.esc="editing = null" />
-                <button class="btn sm primary" @click="saveTpl(p)">保存</button>
-                <button v-if="p.searchUrl !== p.defaultSearchUrl" class="btn sm" @click="resetTpl(p)">默认</button>
-              </div>
-              <button v-else class="tpl" :title="p.searchUrl" @click="startEdit(p)">
-                <code class="ellipsis">{{ p.searchUrl }}</code>
-                <span v-if="p.searchUrl !== p.defaultSearchUrl" class="chip amber">已修改</span>
-                <Icon name="edit" :size="13" />
-              </button>
-            </td>
-            <td class="r">
-              <button v-if="p.custom" class="icon-btn" title="删除" @click="remove(p)"><Icon name="trash" :size="16" /></button>
-            </td>
-          </tr>
+              </td>
+              <td class="st-cell">
+                <span v-if="testing.has(p.id)" class="faint small"><Icon name="refresh" :size="13" class="spin" /> 正在打开搜索页…</span>
+                <template v-else-if="results[p.id]">
+                  <div class="st">
+                    <span v-if="results[p.id]!.ok" class="chip green"><Icon name="check" />通过 · {{ results[p.id]!.withPrice }} 条含价格</span>
+                    <span v-else-if="results[p.id]!.loginRequired" class="chip orange"><Icon name="lock" />需要登录</span>
+                    <span v-else class="chip red"><Icon name="warn" />未通过</span>
+                    <span class="faint tiny">{{ secs(results[p.id]!.ms) }}</span>
+                  </div>
+                  <button v-if="results[p.id]!.samples[0]" class="sample" :title="results[p.id]!.samples[0]!.url" @click="openExternal(results[p.id]!.samples[0]!.url)">
+                    <span class="ellipsis">{{ results[p.id]!.samples[0]!.title }}</span>
+                    <b class="price">{{ money(results[p.id]!.samples[0]!.landed ?? results[p.id]!.samples[0]!.price, results[p.id]!.samples[0]!.currency) }}</b>
+                  </button>
+                  <small v-else-if="results[p.id]!.message" class="faint ellipsis msg" :title="results[p.id]!.message ?? ''">{{ results[p.id]!.message }}</small>
+                </template>
+                <span v-else class="faint tiny">未检测</span>
+              </td>
+              <td class="r">
+                <div class="row ops">
+                  <button class="btn sm" :disabled="testing.has(p.id)" @click="selftest([p.id])"><Icon name="shield" />检测</button>
+                  <button class="btn sm ghost" :class="{ on: editing === p.id }" @click="editing === p.id ? (editing = null) : startEdit(p)"><Icon name="edit" />编辑模板</button>
+                  <button v-if="p.custom" class="icon-btn" title="删除" @click="remove(p)"><Icon name="trash" :size="16" /></button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="editing === p.id" class="tpl-row">
+              <td></td>
+              <td colspan="3">
+                <div class="tpl-edit">
+                  <span class="faint tiny">搜索地址模板（用 {q} 代表关键词；网站改版时可在这里修正）</span>
+                  <div class="row" style="gap: 6px">
+                    <input v-model="tpl" class="input sm mono" @keydown.enter="saveTpl(p)" @keydown.esc="editing = null" />
+                    <button class="btn sm primary" @click="saveTpl(p)">保存</button>
+                    <button v-if="p.searchUrl !== p.defaultSearchUrl" class="btn sm" @click="resetTpl(p)">恢复默认</button>
+                    <button class="btn sm ghost" @click="editing = null">取消</button>
+                  </div>
+                  <code class="faint tiny mono">默认：{{ p.defaultSearchUrl }}</code>
+                </div>
+              </td>
+            </tr>
+          </template>
         </tbody>
       </table>
     </section>
@@ -188,26 +253,67 @@ tr.off td:first-child {
   margin-left: 6px;
   vertical-align: 1px;
 }
-.tpl {
+.cn {
+  color: var(--err);
+}
+.intl {
+  color: var(--brand-ink);
+}
+.st-cell {
+  max-width: 360px;
+}
+.st {
   display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 100%;
-  padding: 4px 8px;
-  border-radius: 8px;
-  border: 1px dashed transparent;
+}
+.sample {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  max-width: 340px;
+  margin-top: 3px;
+  padding: 0;
+  border: none;
   background: transparent;
   cursor: pointer;
-  color: var(--text-3);
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: left;
 }
-.tpl:hover {
-  border-color: var(--line-2);
+.sample:hover span {
+  text-decoration: underline;
+}
+.sample .price {
+  font-size: 12.5px;
+  flex: none;
+}
+.msg {
+  display: block;
+  max-width: 340px;
+  margin-top: 3px;
+}
+.ops {
+  gap: 4px;
+  justify-content: flex-end;
+}
+.ops .on {
+  background: var(--info-bg);
+  color: var(--brand-ink);
+}
+.tpl-row td {
+  border-top: none;
+  padding-top: 0;
+}
+.tpl-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
   background: var(--hover);
 }
-.tpl code {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--text-2);
-  min-width: 0;
+.tpl-edit .input {
+  flex: 1;
 }
 </style>

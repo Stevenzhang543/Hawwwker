@@ -7,8 +7,8 @@ import { useWatchStore } from "@/stores/watch";
 import { useUiStore } from "@/stores/ui";
 import { useAppStore } from "@/stores/app";
 import { ago, interval, money, pct } from "@/utils/format";
-import GSegmented from "@/components/ui/GSegmented.vue";
 import Icon from "@/components/ui/Icon.vue";
+import DealBadge from "@/components/ui/DealBadge.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 import CountUp from "@/components/ui/CountUp.vue";
 import Sparkline from "@/components/charts/Sparkline.vue";
@@ -58,6 +58,12 @@ function progress(w: WatchItem) {
   const total = Math.max(1e-9, (w.highest ?? w.firstPrice) - w.targetPrice);
   return Math.max(4, Math.min(100, (((w.highest ?? w.firstPrice) - w.lastPrice) / total) * 100));
 }
+const merchant = computed(() => app.role === "merchant");
+/** 商户：我的售价相对竞品当前价的位置（正数 = 我更贵） */
+function myGap(w: WatchItem): number | null {
+  if (w.myPrice == null || w.lastPrice == null || w.lastPrice <= 0) return null;
+  return ((w.myPrice - w.lastPrice) / w.lastPrice) * 100;
+}
 const kpi = computed(() => ({
   total: store.items.length,
   drops: store.drops,
@@ -99,12 +105,12 @@ function closeItem() {
   sel.value = null;
   void router.replace({ query: {} });
 }
-const filterOpts = [
-  { value: "all" as const, label: "全部" },
-  { value: "drop" as const, label: "已降价" },
-  { value: "hit" as const, label: "达到目标价" },
-  { value: "error" as const, label: "读价失败" },
-];
+const stats = computed(() => [
+  { value: "all" as const, label: "追踪中", n: kpi.value.total, icon: "tag", tone: "" },
+  { value: "drop" as const, label: "较首次降价", n: kpi.value.drops, icon: "drop", tone: "down" },
+  { value: "hit" as const, label: "达到目标价", n: kpi.value.hits, icon: "target", tone: "amber-t" },
+  { value: "error" as const, label: "读价失败", n: kpi.value.errors, icon: "warn", tone: kpi.value.errors ? "up" : "" },
+]);
 </script>
 
 <template>
@@ -112,28 +118,32 @@ const filterOpts = [
     <div class="page-head">
       <div>
         <h1>价格追踪</h1>
-        <p>盯住单件商品：定时打开商品页读价，降价或达到目标价时提醒你。</p>
+        <p>{{ merchant ? "盯住竞品价格，并和你的售价对比；降价或达到目标价时提醒你。" : "盯住单件商品：定时打开商品页读价，降价或达到目标价时提醒你。" }}</p>
       </div>
-    </div>
-
-    <div class="grid g4">
-      <div class="kpi glass"><span class="faint small">追踪中</span><b><CountUp :value="kpi.total" /></b><Icon name="tag" class="k-ico" /></div>
-      <div class="kpi glass"><span class="faint small">较首次降价</span><b class="down"><CountUp :value="kpi.drops" /></b><Icon name="drop" class="k-ico" /></div>
-      <div class="kpi glass hit"><span class="faint small">达到目标价</span><b class="amber-t"><CountUp :value="kpi.hits" /></b><Icon name="target" class="k-ico" /></div>
-      <div class="kpi glass"><span class="faint small">读价失败</span><b :class="{ up: kpi.errors }"><CountUp :value="kpi.errors" /></b><Icon name="warn" class="k-ico" /></div>
     </div>
 
     <section class="adder glass">
       <Icon name="link" :size="18" class="faint" />
-      <input ref="urlInput" v-model="url" class="bare-input" placeholder="粘贴任意平台的商品链接（Amazon、京东、淘宝、eBay、idealo…）" @keydown.enter="add" />
+      <input
+        ref="urlInput"
+        v-model="url"
+        class="bare-input"
+        :placeholder="merchant ? '粘贴竞品链接（任意平台），追踪它的价格并与我的售价对比' : '粘贴任意平台的商品链接（Amazon、京东、淘宝、eBay、idealo…）'"
+        @keydown.enter="add"
+      />
       <input v-model="target" class="input sm" type="number" style="width: 130px" placeholder="目标价（可选）" />
       <button v-ripple class="btn primary" :disabled="adding" @click="add"><Icon :name="adding ? 'refresh' : 'plus'" :class="{ spin: adding }" />追踪</button>
     </section>
 
-    <div class="row">
-      <GSegmented v-model="filter" :options="filterOpts" small />
+    <!-- 细统计栏：同时也是筛选按钮 -->
+    <div class="statbar glass" role="tablist" aria-label="筛选追踪项">
+      <button v-for="st in stats" :key="st.value" v-ripple class="stat" :class="{ on: filter === st.value }" role="tab" :aria-selected="filter === st.value" @click="filter = st.value">
+        <Icon :name="st.icon" :size="14" />
+        <span>{{ st.label }}</span>
+        <b :class="st.tone"><CountUp :value="st.n" /></b>
+      </button>
       <span class="spacer"></span>
-      <select v-model="sort" class="select sm" style="width: 150px">
+      <select v-model="sort" class="select sm" style="width: 140px" aria-label="排序">
         <option value="recent">最近添加</option>
         <option value="change">降幅最大</option>
         <option value="target">最接近目标价</option>
@@ -162,8 +172,11 @@ const filterOpts = [
           <div>
             <span class="price">{{ money(w.lastPrice, w.currency) }}</span>
             <span v-if="w.currency !== app.displayCurrency && w.lastPrice != null" class="faint tiny conv">≈ {{ money(app.toDisplay(w.lastPrice, w.currency), app.displayCurrency) }}</span>
-            <div class="tiny" :class="(w.changePct ?? 0) < 0 ? 'down' : (w.changePct ?? 0) > 0 ? 'up' : 'faint'">
-              <Icon :name="(w.changePct ?? 0) < 0 ? 'drop' : 'rise'" :size="12" />较首次 {{ pct(w.changePct) }}
+            <div class="row tiny" style="gap: 6px; flex-wrap: wrap">
+              <span :class="(w.changePct ?? 0) < 0 ? 'down' : (w.changePct ?? 0) > 0 ? 'up' : 'faint'">
+                <Icon :name="(w.changePct ?? 0) < 0 ? 'drop' : 'rise'" :size="12" />较首次 {{ pct(w.changePct) }}
+              </span>
+              <DealBadge :deal="w.deal" compact />
             </div>
           </div>
           <Sparkline :data="w.spark" :width="110" :height="38" />
@@ -175,6 +188,12 @@ const filterOpts = [
             <span v-else-if="w.lastPrice != null" class="faint">还差 {{ pct(((w.lastPrice - w.targetPrice) / w.targetPrice) * 100, 1, false) }}</span>
           </div>
           <div class="tbar"><i :style="{ width: (progress(w) ?? 0) + '%' }" :class="{ hit: (progress(w) ?? 0) >= 100 }"></i></div>
+        </div>
+        <div v-if="merchant && w.myPrice != null" class="mine tiny">
+          <Icon name="shop" :size="12" />
+          <span>我的售价 <b>{{ money(w.myPrice, w.currency) }}</b></span>
+          <span class="spacer"></span>
+          <span v-if="myGap(w) != null" :class="(myGap(w) ?? 0) > 0 ? 'up' : 'down'">{{ (myGap(w) ?? 0) > 0 ? "比竞品贵" : "比竞品便宜" }} {{ pct(Math.abs(myGap(w) ?? 0), 1, false) }}</span>
         </div>
         <p v-if="w.lastError" class="err tiny ellipsis"><Icon name="warn" :size="12" /> {{ w.lastError }}</p>
         <div class="wc-foot" @click.stop>
@@ -190,27 +209,57 @@ const filterOpts = [
 </template>
 
 <style scoped>
-.kpi {
-  position: relative;
-  padding: 16px 18px;
+.statbar {
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 4px;
-  overflow: hidden;
+  padding: 5px;
+  border-radius: 14px;
+  flex-wrap: wrap;
 }
-.kpi b {
-  font-size: 28px;
-  font-weight: 720;
+.stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast), transform var(--t-mid) var(--spring);
+}
+.stat:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.stat:active {
+  transform: scale(0.96);
+}
+.stat.on {
+  background: var(--glass-3);
+  color: var(--text);
+  box-shadow: var(--shadow-1), inset 0 0 0 1px var(--line);
+}
+.stat b {
   font-family: var(--font-num);
+  font-size: 15px;
+  font-weight: 720;
 }
-.k-ico {
-  position: absolute;
-  right: 14px;
-  top: 14px;
-  width: 22px !important;
-  height: 22px !important;
-  color: var(--text-3);
-  opacity: 0.6;
+.mine {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 9px;
+  border-radius: 10px;
+  background: var(--hover);
+  color: var(--text-2);
+}
+.mine b {
+  color: var(--text);
 }
 .amber-t {
   color: var(--amber-ink);

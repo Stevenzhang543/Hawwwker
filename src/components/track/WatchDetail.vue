@@ -4,6 +4,7 @@ import { api, openExternal, toAppError } from "@/api";
 import type { PricePoint, WatchItem } from "@/api/types";
 import { useWatchStore } from "@/stores/watch";
 import { useUiStore } from "@/stores/ui";
+import { useAppStore } from "@/stores/app";
 import { ago, dateTime, interval, money, pct } from "@/utils/format";
 import GSheet from "@/components/ui/GSheet.vue";
 import GSegmented from "@/components/ui/GSegmented.vue";
@@ -11,12 +12,14 @@ import GSwitch from "@/components/ui/GSwitch.vue";
 import Icon from "@/components/ui/Icon.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 import PriceTag from "@/components/ui/PriceTag.vue";
+import DealBadge from "@/components/ui/DealBadge.vue";
 import LineChart from "@/components/charts/LineChart.vue";
 
 const props = defineProps<{ item: WatchItem | null }>();
 const emit = defineEmits<{ close: [] }>();
 const store = useWatchStore();
 const ui = useUiStore();
+const app = useAppStore();
 const open = computed({ get: () => !!props.item, set: (v) => !v && emit("close") });
 const days = ref(90);
 const hist = ref<PricePoint[]>([]);
@@ -24,6 +27,8 @@ const loading = ref(false);
 const target = ref("");
 const iv = ref(360);
 const note = ref("");
+const myPrice = ref("");
+const merchant = computed(() => app.role === "merchant");
 
 const live = computed(() => (props.item ? store.items.find((x) => x.id === props.item!.id) ?? props.item : null));
 
@@ -45,6 +50,7 @@ watch(
     target.value = props.item.targetPrice != null ? String(props.item.targetPrice) : "";
     iv.value = props.item.intervalMinutes;
     note.value = props.item.note;
+    myPrice.value = props.item.myPrice != null ? String(props.item.myPrice) : "";
     void load();
   },
   { immediate: true },
@@ -52,12 +58,29 @@ watch(
 watch(days, load);
 watch(() => live.value?.lastCheckedAt, load);
 
+/** 商户：我的售价相对竞品当前价 / 历史最低价的位置 */
+const position = computed(() => {
+  const w = live.value;
+  const mine = myPrice.value.trim() ? Number(myPrice.value) : w?.myPrice ?? null;
+  if (!w || mine == null || !Number.isFinite(mine)) return null;
+  const rel = (base: number | null | undefined) => (base && base > 0 ? ((mine - base) / base) * 100 : null);
+  const cur = rel(w.lastPrice);
+  const low = rel(w.lowest);
+  const say = (v: number | null, what: string) => (v == null ? null : Math.abs(v) < 0.5 ? `与${what}持平` : `比${what}${v > 0 ? "高" : "低"} ${pct(Math.abs(v), 1, false)}`);
+  return { cur, text: [say(cur, "竞品当前价"), say(low, "竞品历史最低")].filter(Boolean).join(" · ") };
+});
+
 const series = computed(() => [{ key: "w", label: "价格", color: "#3d7bff", points: hist.value.map((h) => ({ t: new Date(h.t).getTime(), v: h.price })) }]);
 
 async function save() {
   if (!live.value) return;
   try {
-    await store.update(live.value.id, { targetPrice: target.value.trim() ? Number(target.value) : null, intervalMinutes: iv.value, note: note.value });
+    await store.update(live.value.id, {
+      targetPrice: target.value.trim() ? Number(target.value) : null,
+      intervalMinutes: iv.value,
+      note: note.value,
+      ...(merchant.value || live.value.myPrice != null ? { myPrice: myPrice.value.trim() ? Number(myPrice.value) : null } : {}),
+    });
     ui.toast("已保存", "success", 1500);
   } catch (e) {
     ui.toast(toAppError(e).message, "error");
@@ -109,7 +132,9 @@ const dayOpts = [
             <span v-if="live.changePct != null" class="chip" :class="live.changePct < 0 ? 'green' : live.changePct > 0 ? 'red' : ''">
               <Icon :name="live.changePct < 0 ? 'drop' : 'rise'" />较首次 {{ pct(live.changePct) }}
             </span>
+            <DealBadge :deal="live.deal" show-new />
           </div>
+          <p v-if="live.deal" class="faint tiny">价格判断依据：{{ live.deal.basis }}</p>
           <p class="faint small">最低 {{ money(live.lowest, live.currency) }} · 最高 {{ money(live.highest, live.currency) }} · 上次检查 {{ ago(live.lastCheckedAt) }} · 下次 {{ ago(live.nextCheckAt) }}</p>
           <p v-if="live.lastError" class="banner" style="padding: 8px 12px"><Icon name="warn" />{{ live.lastError }}</p>
           <div class="row wrap">
@@ -142,6 +167,14 @@ const dayOpts = [
               <option v-for="m in intervals" :key="m" :value="m">每 {{ interval(m) }}</option>
             </select>
           </label>
+          <label v-if="merchant || live.myPrice != null" class="field">
+            <span>我的售价（{{ live.currency }}）</span>
+            <input v-model="myPrice" class="input" type="number" placeholder="填写后显示相对竞品的位置" />
+          </label>
+          <div v-if="(merchant || live.myPrice != null) && position" class="field pos">
+            <span>定价位置</span>
+            <p class="pos-text" :class="(position.cur ?? 0) > 0 ? 'up' : 'down'"><Icon name="shop" :size="14" />{{ position.text || "等待竞品读价" }}</p>
+          </div>
           <label class="field full">
             <span>备注</span>
             <input v-model="note" class="input" placeholder="例如：等双十一 / 竞品对标" />
@@ -182,6 +215,20 @@ const dayOpts = [
   border-radius: 18px;
   object-fit: cover;
   flex: none;
+}
+.pos-text {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 38px;
+  padding-top: 2px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  font-weight: 600;
+}
+.pos-text :deep(.ico) {
+  flex: none;
+  margin-top: 2px;
 }
 .top h2 {
   font-size: 16.5px;

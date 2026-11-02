@@ -3,6 +3,7 @@
 
 pub mod cdp;
 pub mod extract;
+pub mod launch;
 pub mod login;
 pub mod manager;
 

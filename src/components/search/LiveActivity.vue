@@ -8,7 +8,8 @@ import { duration } from "@/utils/format";
 import Icon from "@/components/ui/Icon.vue";
 import PlatformBadge from "@/components/ui/PlatformBadge.vue";
 
-const props = defineProps<{ run: RunState }>();
+/** slim = 已有结果时收成一行状态栏（可展开为完整面板） */
+const props = defineProps<{ run: RunState; slim?: boolean }>();
 const emit = defineEmits<{ cancel: []; showBrowser: [] }>();
 const platforms = usePlatformStore();
 const router = useRouter();
@@ -31,6 +32,26 @@ const title = computed(() => {
   if (r.status === "interrupted") return "已中断";
   return r.stageLabel || "处理中…";
 });
+const expanded = ref(false);
+const compact = computed(() => !!props.slim && !expanded.value);
+const doneCount = computed(() => plist.value.filter(([, p]) => !["queued", "searching", "waiting_user"].includes(p.state)).length);
+const partialCount = computed(() => Object.values(props.run.partial).reduce((n, l) => n + l.length, 0));
+const line = computed(() => {
+  const r = props.run;
+  const n = plist.value.length;
+  if (r.status === "running") {
+    const parts = [`${doneCount.value}/${n} 个平台完成`];
+    if (partialCount.value && !r.results.length) parts.push(`已出 ${partialCount.value} 条初步结果`);
+    if (r.verify) parts.push(`AI 确认 ${r.verify.matched} 条`);
+    return parts.join(" · ");
+  }
+  const parts = [`${n} 个平台`];
+  if (r.filter) parts.push(`抓取 ${r.filter.fetched}`);
+  if (r.verify) parts.push(`AI 确认匹配 ${r.verify.matched}`);
+  if (r.verify?.hidden) parts.push(`折叠 ${r.verify.hidden}`);
+  if (r.stats?.aiCalls) parts.push(`AI 调用 ${r.stats.aiCalls} 次`);
+  return parts.join(" · ");
+});
 const dropText = computed(() => {
   const d = props.run.filter?.dropped ?? {};
   return Object.entries(d)
@@ -41,7 +62,38 @@ const dropText = computed(() => {
 </script>
 
 <template>
-  <section class="la glass" :class="[run.status]">
+  <section v-if="compact" class="la slim glass" :class="[run.status]">
+    <div class="slim-row">
+      <div class="orb sm" :class="{ live: running }">
+        <Icon v-if="run.status === 'done'" name="check" :size="14" :stroke="2.8" />
+        <Icon v-else-if="run.status === 'error'" name="warn" :size="13" />
+        <Icon v-else-if="!running" name="stop" :size="12" />
+      </div>
+      <b class="slim-title">{{ title }}</b>
+      <span class="muted small ellipsis slim-line">{{ line }}</span>
+      <span class="mini-pills">
+        <span v-for="[id, p] in plist" :key="id" class="mp" :class="p.state" :title="`${platforms.label(id)}：${p.state === 'done' ? p.count + ' 条' : PSTATE[p.state].label}`">
+          <PlatformBadge :id="id" :show-name="false" />
+          <i></i>
+        </span>
+      </span>
+      <button v-if="needLogin.length" class="chip orange click" @click="router.push('/platforms/accounts')"><Icon name="key" />{{ needLogin.length }} 个平台需登录</button>
+      <span class="spacer"></span>
+      <span class="time num">{{ duration(elapsed) }}</span>
+      <button v-if="running" class="btn sm ghost" title="把自动化浏览器窗口移到屏幕上" @click="emit('showBrowser')"><Icon name="monitor" />浏览器</button>
+      <button v-if="running" v-ripple class="btn sm danger" @click="emit('cancel')"><Icon name="stop" />取消</button>
+      <button class="icon-btn" title="展开搜索过程" @click="expanded = true"><Icon name="down" :size="16" /></button>
+    </div>
+    <div v-if="running" class="slim-bar"><i :style="{ width: Math.max(3, run.progress * 100) + '%' }"></i></div>
+    <div v-if="waiting" class="banner" style="margin-top: 8px">
+      <Icon name="warn" />有平台需要你在浏览器窗口中完成登录或安全验证，完成后会自动继续。
+      <span class="spacer"></span>
+      <button class="btn sm" @click="emit('showBrowser')">显示浏览器</button>
+    </div>
+    <div v-if="run.error" class="banner" style="margin-top: 8px; background: var(--err-bg); color: var(--err)"><Icon name="warn" />{{ run.error }}</div>
+  </section>
+
+  <section v-else class="la glass" :class="[run.status]">
     <div class="la-head">
       <div class="orb" :class="{ live: running }">
         <Icon v-if="run.status === 'done'" name="check" :size="20" :stroke="2.6" />
@@ -55,6 +107,7 @@ const dropText = computed(() => {
       <span class="time num">{{ duration(elapsed) }}</span>
       <button v-if="running" class="btn sm" title="把自动化浏览器窗口移到屏幕上" @click="emit('showBrowser')"><Icon name="monitor" />显示浏览器</button>
       <button v-if="running" v-ripple class="btn sm danger" @click="emit('cancel')"><Icon name="stop" />取消</button>
+      <button v-if="slim" class="icon-btn" title="收起" @click="expanded = false"><Icon name="up" :size="16" /></button>
     </div>
 
     <template v-if="run.status !== 'done'">
@@ -105,6 +158,82 @@ const dropText = computed(() => {
 <style scoped>
 .la {
   padding: 16px 18px 14px;
+}
+.la.slim {
+  padding: 8px 12px;
+  position: relative;
+  overflow: hidden;
+}
+.slim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.orb.sm {
+  width: 26px;
+  height: 26px;
+}
+.orb.sm.live::after {
+  inset: 4px;
+}
+.slim-title {
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+.slim-line {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.mini-pills {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+.mp {
+  position: relative;
+  display: inline-flex;
+}
+.mp i {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--bg-solid);
+  background: var(--text-3);
+}
+.mp.done i {
+  background: var(--ok);
+}
+.mp.searching i {
+  background: var(--brand);
+  animation: pulse 0.9s infinite;
+}
+.mp.error i {
+  background: var(--err);
+}
+.mp.login_required i,
+.mp.waiting_user i {
+  background: var(--warn);
+}
+.slim-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--hover);
+}
+.slim-bar i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #3d7bff, #8a5cff, #ffb020, #3d7bff);
+  background-size: 300% 100%;
+  animation: flow 2s linear infinite;
+  transition: width 600ms var(--spring-soft);
 }
 .la-head {
   display: flex;

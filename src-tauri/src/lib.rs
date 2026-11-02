@@ -5,6 +5,7 @@ pub mod ai;
 pub mod browser;
 pub mod commands;
 pub mod db;
+pub mod deal;
 pub mod error;
 pub mod fx;
 pub mod insights;
@@ -14,6 +15,7 @@ pub mod notify;
 pub mod platforms;
 pub mod scheduler;
 pub mod search;
+pub mod selftest;
 pub mod settings;
 pub mod state;
 pub mod tracker;
@@ -21,9 +23,39 @@ pub mod tracker;
 use state::AppState;
 use tauri::Manager;
 
-pub const VERSION: &str = "26.01";
+pub const VERSION: &str = "26.02";
+
+/// 命令行：`hawwwker --selftest-sites <报告.md> [平台id…]`
+/// 用独立的临时浏览器目录对平台做真实小搜索，写出报告后退出（不打开主窗口、不读取你的登录会话）。
+fn selftest_cli(args: &[String]) -> bool {
+    let Some(pos) = args.iter().position(|a| a == "--selftest-sites") else { return false };
+    let out = args.get(pos + 1).cloned().unwrap_or_else(|| "hawwwker-selftest.md".into());
+    let wanted: Vec<String> = args.iter().skip(pos + 2).cloned().collect();
+    tauri::async_runtime::block_on(async move {
+        let dir = std::env::temp_dir().join(format!("hawwwker-selftest-{}", std::process::id()));
+        let browser = std::sync::Arc::new(browser::manager::Browser::new(dir.clone()));
+        browser.configure(true, 3);
+        let list: Vec<platforms::Platform> = platforms::BUILTIN
+            .iter()
+            .filter(|p| wanted.is_empty() || wanted.iter().any(|w| w == &p.id))
+            .cloned()
+            .collect();
+        let futs = list.iter().map(|p| selftest::run_one(&browser, p, None));
+        let results = futures_util::future::join_all(futs).await;
+        let md = selftest::report_markdown(&results, &list);
+        let _ = std::fs::write(&out, md);
+        let _ = std::fs::write(format!("{out}.json"), serde_json::to_string_pretty(&results).unwrap_or_default());
+        browser.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    true
+}
 
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    if selftest_cli(&args) {
+        return;
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -41,7 +73,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
+            // 便携版启动器通过 HAWWWKER_DATA_DIR 把数据放在 exe 旁边；安装版使用系统应用数据目录
+            let dir = match std::env::var_os("HAWWWKER_DATA_DIR").filter(|v| !v.is_empty()) {
+                Some(d) => std::path::PathBuf::from(d),
+                None => app.path().app_data_dir()?,
+            };
+            log::info!("data dir: {}", dir.display());
             let state = AppState::new(dir)?;
             match state.db.recover_after_crash() {
                 Ok(n) if n > 0 => log::info!("marked {n} interrupted runs"),
@@ -105,6 +142,12 @@ pub fn run() {
             commands::copilot_history,
             commands::copilot_send,
             commands::copilot_reset,
+            commands::link_inspect,
+            commands::feedback_set,
+            commands::run_export,
+            commands::ai_detect_local,
+            commands::platforms_recommend,
+            commands::platform_selftest,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Hawwwker")
